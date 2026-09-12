@@ -663,6 +663,7 @@ const JS_FIND_PICKER: &str = r#"(() => {
   const rowTop = plus.getBoundingClientRect().top;
   const hits = [...document.querySelectorAll('button[aria-haspopup="menu"]')].filter(b => {
     if (b.getAttribute('data-testid') === 'composer-plus-btn') return false;
+    if (b.hasAttribute('data-trailing-button')) return false;
     const r = b.getBoundingClientRect();
     return r.width > 0 && r.height > 0 && Math.abs(r.top - rowTop) < 6;
   });
