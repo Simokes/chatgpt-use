@@ -1063,6 +1063,13 @@ impl Channel {
             }
         }
 
+        if opts.temporary {
+            let normal_deadline = Instant::now() + Duration::from_secs(timeout_secs.min(20));
+            chan.ensure_normal_chat(normal_deadline).with_context(|| {
+                "could not restore a verified normal chat before selecting model settings"
+            })?;
+        }
+
         // Apply an explicitly requested model on the now-settled composer (after
         // any project navigation).
         //
@@ -1106,42 +1113,72 @@ impl Channel {
         Ok(chan)
     }
 
-    fn temporary_chat_state(&self, budget: f64) -> Result<bool> {
+    fn temporary_chat_mode(&self, budget: f64) -> Result<Option<bool>> {
         let state = ab_eval(&self.ab, r#"(() => {
           const uses = [...document.querySelectorAll('use')];
           const find = name => uses.find(x => (x.getAttribute('href') || '').endsWith(name));
           const visible = u => {
             const svg = u && u.closest('svg');
             if (!svg) return false;
-            const s = getComputedStyle(svg);
-            return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || '0') > 0.5;
+            const cs = getComputedStyle(svg);
+            return cs.display !== 'none' && cs.visibility !== 'hidden' && Number(cs.opacity || '0') > 0.5;
           };
           const url = new URL(location.href);
           return JSON.stringify({ query: url.searchParams.get('temporary-chat'), normal: visible(find('#chat-temp')), checked: visible(find('#chat-temp-checked')) });
         })()"#, &self.session, budget)?;
-        Ok(state.get("query").and_then(|v| v.as_str()) == Some("true")
-            && state.get("checked").and_then(|v| v.as_bool()) == Some(true)
-            && state.get("normal").and_then(|v| v.as_bool()) == Some(false))
+        let query_on = state.get("query").and_then(|v| v.as_str()) == Some("true");
+        let normal = state.get("normal").and_then(|v| v.as_bool());
+        let checked = state.get("checked").and_then(|v| v.as_bool());
+        match (query_on, normal, checked) {
+            (true, Some(false), Some(true)) => Ok(Some(true)),
+            (false, Some(true), Some(false)) => Ok(Some(false)),
+            _ => Ok(None),
+        }
     }
 
-    fn ensure_temporary_chat(&self, deadline: Instant) -> Result<()> {
-        if self.temporary_chat_state(8.0)? {
-            eprintln!("temporary chat: confirmed");
-            return Ok(());
-        }
+    fn click_temporary_toggle(&self, budget: f64) -> Result<()> {
         let click = ab_eval(&self.ab, r#"(() => {
           const use = [...document.querySelectorAll('use')].find(x => (x.getAttribute('href') || '').endsWith('#chat-temp'));
           const button = use && use.closest('button');
           if (!button) return JSON.stringify({ clicked: false });
           button.click();
           return JSON.stringify({ clicked: true });
-        })()"#, &self.session, 8.0)?;
-        if click.get("clicked").and_then(|v| v.as_bool()) != Some(true) {
-            bail!("Temporary Chat toggle was not found");
+        })()"#, &self.session, budget)?;
+        if click.get("clicked").and_then(|v| v.as_bool()) == Some(true) {
+            Ok(())
+        } else {
+            bail!("Temporary Chat toggle was not found")
+        }
+    }
+
+    fn ensure_normal_chat(&self, deadline: Instant) -> Result<()> {
+        match self.temporary_chat_mode(8.0)? {
+            Some(false) => return Ok(()),
+            Some(true) => self.click_temporary_toggle(8.0)?,
+            None => bail!("Temporary Chat state is ambiguous; refusing to change model settings"),
         }
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(250));
-            if self.temporary_chat_state(5.0).unwrap_or(false) {
+            if self.temporary_chat_mode(5.0).ok() == Some(Some(false)) {
+                eprintln!("temporary chat: disabled and verified before model selection");
+                return Ok(());
+            }
+        }
+        bail!("Temporary Chat could not be disabled before model selection")
+    }
+
+    fn ensure_temporary_chat(&self, deadline: Instant) -> Result<()> {
+        match self.temporary_chat_mode(8.0)? {
+            Some(true) => {
+                eprintln!("temporary chat: confirmed");
+                return Ok(());
+            }
+            Some(false) => self.click_temporary_toggle(8.0)?,
+            None => bail!("Temporary Chat state is ambiguous; refusing to submit"),
+        }
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(250));
+            if self.temporary_chat_mode(5.0).ok() == Some(Some(true)) {
                 eprintln!("temporary chat: enabled and verified");
                 return Ok(());
             }
