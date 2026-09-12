@@ -1277,13 +1277,13 @@ impl Channel {
             );
         }
 
-        // Insert in chunks — a multi-KB argument overruns chrome-use's IPC and
-        // fails with EAGAIN ("Resource temporarily unavailable"). Each chunk
+        // Insert in bounded chunks. The Windows/WSL bridge was integrity-tested up to
+        // 24k characters; 16k leaves headroom for escaping and command overhead. Each chunk
         // appends at the caret. Split on char boundaries (prompts contain
         // multibyte text). See `js_insert_text` for why this is not `keyboard
         // type`: typed newlines submit, which silently shredded every multi-line
         // prompt into one chat message per line.
-        const INSERT_CHUNK_CHARS: usize = 1500;
+        const INSERT_CHUNK_CHARS: usize = 16_000;
         let chars: Vec<char> = message.chars().collect();
         for chunk in chars.chunks(INSERT_CHUNK_CHARS) {
             let piece: String = chunk.iter().collect();
