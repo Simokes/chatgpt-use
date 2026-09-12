@@ -2381,20 +2381,43 @@ impl Channel {
             let detail = pick.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
             bail!("could not find the composer model picker: {detail}");
         }
-        let (px, py) = match (
-            pick.get("x").and_then(|v| v.as_i64()),
-            pick.get("y").and_then(|v| v.as_i64()),
-        ) {
-            (Some(x), Some(y)) => (x, y),
-            _ => bail!("composer model picker has no usable coordinates"),
-        };
-        ab_cmd(&self.ab, &["click", &px.to_string(), &py.to_string()], &self.session, remaining())
+        let mut st = serde_json::Value::Null;
+        let mut opened = false;
+        for open_attempt in 0..3 {
+            if open_attempt > 0 {
+                pick = ab_eval(&self.ab, JS_FIND_PICKER, &self.session, remaining())?;
+            }
+            let (px, py) = match (
+                pick.get("x").and_then(|v| v.as_i64()),
+                pick.get("y").and_then(|v| v.as_i64()),
+            ) {
+                (Some(x), Some(y)) => (x, y),
+                _ => bail!("composer model picker has no usable coordinates"),
+            };
+            ab_cmd(
+                &self.ab,
+                &["click", &px.to_string(), &py.to_string()],
+                &self.session,
+                remaining(),
+            )
             .context("opening the composer model picker")?;
-        std::thread::sleep(Duration::from_millis(500));
 
-        let st = ab_eval(&self.ab, JS_PICKER_MENU, &self.session, remaining())?;
-        if !st.get("open").and_then(|v| v.as_bool()).unwrap_or(false) {
-            bail!("clicked the model picker but its menu did not open");
+            for _ in 0..6 {
+                std::thread::sleep(Duration::from_millis(250));
+                st = ab_eval(&self.ab, JS_PICKER_MENU, &self.session, remaining())?;
+                if st.get("open").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    opened = true;
+                    break;
+                }
+            }
+            if opened {
+                break;
+            }
+            let _ = ab_cmd(&self.ab, &["press", "Escape"], &self.session, remaining());
+            std::thread::sleep(Duration::from_millis(350));
+        }
+        if !opened {
+            bail!("clicked the model picker repeatedly but its menu did not open");
         }
 
         let outcome = match want_level {
