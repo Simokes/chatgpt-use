@@ -660,6 +660,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         profile: args.channel.profile.clone(),
         session: args.channel.session.clone(),
         project: args.channel.project.clone(),
+        temporary: false,
         timeout_secs: args.channel.timeout,
         model: args.channel.model.clone(),
         busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,

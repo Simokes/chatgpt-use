@@ -122,9 +122,10 @@ fn channel_opts_from_args(args: &RunArgs) -> ChannelOptions {
     ChannelOptions {
         profile: args.channel.profile.clone(),
         session: args.channel.session.clone(),
-        project: args.channel.project.clone(),
+        project: if args.channel.temporary { String::new() } else { args.channel.project.clone() },
+        temporary: args.channel.temporary,
         timeout_secs: args.channel.timeout,
-        model: args.channel.model.clone(),
+        model: args.channel.requested_model(),
         busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
         receipt: None,
     }

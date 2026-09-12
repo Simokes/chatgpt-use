@@ -768,6 +768,8 @@ pub struct ChannelOptions {
     pub session: Option<String>,
     /// ChatGPT Project name to file the conversation under ("" → plain chat).
     pub project: String,
+    /// Require ChatGPT Temporary Chat before any prompt is submitted.
+    pub temporary: bool,
     /// Per-turn wall-clock budget in seconds.
     pub timeout_secs: u64,
     /// Browser-channel model to select: pro | thinking | instant | <raw label>.
@@ -1018,7 +1020,7 @@ impl Channel {
             ab,
             session,
             timeout_secs,
-            project: opts.project.trim().to_string(),
+            project: if opts.temporary { String::new() } else { opts.project.trim().to_string() },
             convo_id: None,
             pending_project: None,
             submitted: false,
@@ -1028,7 +1030,7 @@ impl Channel {
 
         // Navigate into a ChatGPT Project FIRST — it loads a new page and would
         // reset any model selection, so model selection must come afterwards.
-        let project = opts.project.trim().to_string();
+        let project = if opts.temporary { String::new() } else { opts.project.trim().to_string() };
         if !project.is_empty() {
             let proj_deadline = Instant::now() + Duration::from_secs(timeout_secs);
             match chan.resolve_project(&project, proj_deadline) {
@@ -1072,19 +1074,79 @@ impl Channel {
         // caller named a model, so erring here refuses exactly the request we
         // cannot honour.
         if let Some(ref model) = opts.model {
-            let model_deadline = Instant::now() + Duration::from_secs(timeout_secs.min(30));
-            chan.select_model(model, model_deadline).with_context(|| {
-                format!(
-                    "could not select model {model:?} — refusing to run on the account \
-                     default instead. ChatGPT relabelled the composer picker from \
-                     Intelligence levels (instant/high/pro) to model names \
-                     (e.g. \"5.6 SolLight\"), so the selector needs updating; rerun \
-                     without --model to accept whatever the account is set to"
-                )
+            let selections: Vec<&str> = if let Some(spec) = model.strip_prefix("__axes__\t") {
+                let mut parts = spec.splitn(2, '\t');
+                let family = parts.next().unwrap_or("");
+                let effort = parts.next().unwrap_or("");
+                [family, effort].into_iter().filter(|s| !s.is_empty()).collect()
+            } else {
+                vec![model.as_str()]
+            };
+
+            for selection in selections {
+                let model_deadline = Instant::now() + Duration::from_secs(timeout_secs.min(30));
+                chan.select_model(selection, model_deadline).with_context(|| {
+                    format!(
+                        "could not select requested model setting {selection:?} — refusing \
+                         to run with a different ChatGPT model or thinking effort"
+                    )
+                })?;
+            }
+        }
+
+
+        if opts.temporary {
+            let temporary_deadline = Instant::now() + Duration::from_secs(timeout_secs.min(20));
+            chan.ensure_temporary_chat(temporary_deadline).with_context(|| {
+                "could not confirm ChatGPT Temporary Chat — refusing to submit in a normal chat"
             })?;
         }
 
+
         Ok(chan)
+    }
+
+    fn temporary_chat_state(&self, budget: f64) -> Result<bool> {
+        let state = ab_eval(&self.ab, r#"(() => {
+          const uses = [...document.querySelectorAll('use')];
+          const find = name => uses.find(x => (x.getAttribute('href') || '').endsWith(name));
+          const visible = u => {
+            const svg = u && u.closest('svg');
+            if (!svg) return false;
+            const s = getComputedStyle(svg);
+            return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || '0') > 0.5;
+          };
+          const url = new URL(location.href);
+          return JSON.stringify({ query: url.searchParams.get('temporary-chat'), normal: visible(find('#chat-temp')), checked: visible(find('#chat-temp-checked')) });
+        })()"#, &self.session, budget)?;
+        Ok(state.get("query").and_then(|v| v.as_str()) == Some("true")
+            && state.get("checked").and_then(|v| v.as_bool()) == Some(true)
+            && state.get("normal").and_then(|v| v.as_bool()) == Some(false))
+    }
+
+    fn ensure_temporary_chat(&self, deadline: Instant) -> Result<()> {
+        if self.temporary_chat_state(8.0)? {
+            eprintln!("temporary chat: confirmed");
+            return Ok(());
+        }
+        let click = ab_eval(&self.ab, r#"(() => {
+          const use = [...document.querySelectorAll('use')].find(x => (x.getAttribute('href') || '').endsWith('#chat-temp'));
+          const button = use && use.closest('button');
+          if (!button) return JSON.stringify({ clicked: false });
+          button.click();
+          return JSON.stringify({ clicked: true });
+        })()"#, &self.session, 8.0)?;
+        if click.get("clicked").and_then(|v| v.as_bool()) != Some(true) {
+            bail!("Temporary Chat toggle was not found");
+        }
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(250));
+            if self.temporary_chat_state(5.0).unwrap_or(false) {
+                eprintln!("temporary chat: enabled and verified");
+                return Ok(());
+            }
+        }
+        bail!("Temporary Chat toggle was clicked but the verified active state never appeared")
     }
 
     /// Put `message` in the composer and submit it, returning only once a new
@@ -1479,6 +1541,7 @@ impl Channel {
             profile: opts.profile.clone(),
             session: opts.session.clone(),
             project: String::new(),
+            temporary: false,
             timeout_secs: opts.timeout_secs,
             model: None,
             busy_fail: opts.busy_fail,
@@ -2324,7 +2387,7 @@ impl Channel {
         let now = slider.get("now").and_then(|v| v.as_i64()).unwrap_or(-1);
         let max = slider.get("max").and_then(|v| v.as_i64()).unwrap_or(-1);
         let last = (LEVEL_ORDER.len() - 1) as i64;
-        if max != last {
+        if max > last || idx as i64 > max {
             bail!(
                 "the thinking-effort slider now has {} positions but this build \\
                  knows {} levels ({}) — refusing to guess which is which",

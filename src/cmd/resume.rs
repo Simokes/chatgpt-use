@@ -55,6 +55,7 @@ fn resume(args: &ResumeArgs) -> Value {
         profile: args.channel.profile.clone(),
         session: args.channel.session.clone(),
         project: String::new(),
+        temporary: false,
         timeout_secs: args.channel.timeout,
         model: None,
         busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,

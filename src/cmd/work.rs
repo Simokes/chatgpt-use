@@ -48,6 +48,7 @@ pub fn run(args: &WorkArgs) -> Result<()> {
         profile: args.channel.profile.clone(),
         session: args.channel.session.clone(),
         project: args.channel.project.clone(),
+        temporary: false,
         timeout_secs,
         model,
         busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,

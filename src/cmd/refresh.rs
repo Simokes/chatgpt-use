@@ -31,6 +31,7 @@ pub fn run(args: &RefreshArgs) -> Result<()> {
         profile: args.channel.profile.clone(),
         session: args.channel.session.clone(),
         project: String::new(),
+        temporary: false,
         timeout_secs: args.channel.timeout.max(60),
         model: None,
         busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,

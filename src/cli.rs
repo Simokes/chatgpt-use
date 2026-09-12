@@ -141,6 +141,9 @@ pub struct ChannelArgs {
     /// File the conversation under a ChatGPT Project (empty = plain chat).
     #[arg(long, default_value = "chatgpt-use")]
     pub project: String,
+    /// Use a Temporary Chat. Temporary runs are always plain chats, outside Projects.
+    #[arg(long)]
+    pub temporary: bool,
     /// Total wall-clock budget per model turn, in seconds.
     #[arg(long, default_value_t = 300)]
     pub timeout: u64,
@@ -149,10 +152,34 @@ pub struct ChannelArgs {
     /// here (it has no Apps/MCP). Default: the account's current level.
     #[arg(long)]
     pub model: Option<String>,
+    /// Select the ChatGPT model family independently of thinking effort.
+    /// Example: --model-family "GPT-5.6 Sol"
+    #[arg(long = "model-family", conflicts_with = "model")]
+    pub model_family: Option<String>,
+    /// Select thinking effort independently of model family.
+    /// Example: --effort high
+    #[arg(long, conflicts_with = "model")]
+    pub effort: Option<String>,
     /// When another run is using the ChatGPT window: wait for it, or fail at
     /// once (error kind "busy") without touching the browser.
     #[arg(long, value_enum, default_value_t = BusyPolicy::Wait)]
     pub busy: BusyPolicy,
+}
+
+impl ChannelArgs {
+    /// Encode independently requested model axes into the legacy single model
+    /// field used by ChannelOptions. The channel decodes this private prefix.
+    pub fn requested_model(&self) -> Option<String> {
+        if self.model_family.is_some() || self.effort.is_some() {
+            Some(format!(
+                "__axes__\t{}\t{}",
+                self.model_family.as_deref().unwrap_or(""),
+                self.effort.as_deref().unwrap_or("")
+            ))
+        } else {
+            self.model.clone()
+        }
+    }
 }
 
 #[derive(Args, Debug)]
