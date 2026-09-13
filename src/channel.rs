@@ -1187,6 +1187,32 @@ impl Channel {
         bail!("Temporary Chat toggle was clicked but the verified active state never appeared")
     }
 
+    pub fn attach_file(&self, path: &str) -> Result<()> {
+        let name = path.rsplit(|c: char| c == '/' || c == '\\').next().unwrap_or(path);
+        if name.trim().is_empty() {
+            bail!("attachment path has no file name");
+        }
+        ab_cmd(&self.ab, &["upload", "#upload-files", path], &self.session, 30.0)
+            .with_context(|| format!("uploading attachment {name:?}"))?;
+        let target = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_string());
+        let js = format!(r#"(() => {{
+          const target = {target};
+          const present = [...document.querySelectorAll('button')]
+            .some(b => (b.textContent || '').trim() === target || b.getAttribute('aria-label') === target);
+          return JSON.stringify({{present}});
+        }})()"#);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if ab_eval(&self.ab, &js, &self.session, 8.0).ok()
+                .and_then(|v| v.get("present").and_then(|x| x.as_bool())) == Some(true) {
+                eprintln!("attached file: {name}");
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        bail!("attachment {name:?} did not appear in the composer")
+    }
+
     /// Put `message` in the composer and submit it, returning only once a new
     /// user turn proves the submit landed.
     fn fill_and_submit(

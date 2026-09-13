@@ -60,13 +60,21 @@ fn ask_message(args: &AskArgs) -> Result<String> {
     Ok(message)
 }
 
+fn attach_requested_files(channel: &Channel, args: &AskArgs) -> Result<()> {
+    for file in &args.attach_files {
+        channel.attach_file(file)
+            .with_context(|| format!("failed to attach browser file: {file}"))?;
+    }
+    Ok(())
+}
+
 fn run_ask_mode(args: &AskArgs, mut opts: ChannelOptions) -> Result<()> {
     let message = ask_message(args)?;
     opts.receipt = claim_receipt(args)?;
 
     // Connect, send one turn, print the reply, always close.
     let reply = Channel::connect(&opts).and_then(|mut channel| {
-        let reply = channel.send(&message);
+        let reply = attach_requested_files(&channel, args).and_then(|_| channel.send(&message));
         channel.close();
         reply
     });
@@ -82,6 +90,7 @@ fn run_ask_mode(args: &AskArgs, mut opts: ChannelOptions) -> Result<()> {
         serde_json::json!({
             "prompt_chars": args.prompt.len(),
             "files": args.files.len(),
+            "attachments": args.attach_files.len(),
             "model": args.channel.model,
             "reply_chars": text.len(),
         }),
@@ -118,7 +127,7 @@ fn run_schema_mode(args: &AskArgs, mut opts: ChannelOptions, schema_path: &str) 
                 match Channel::connect(&opts) {
                     Err(e) => structured::failure(&e),
                     Ok(mut channel) => {
-                        let reply = channel.send(&message);
+                        let reply = attach_requested_files(&channel, args).and_then(|_| channel.send(&message));
                         let convo = channel.conversation_id().map(str::to_string);
                         channel.close();
                         let mut envelope = structured::evaluate(reply, &schema);
@@ -142,6 +151,7 @@ fn run_schema_mode(args: &AskArgs, mut opts: ChannelOptions, schema_path: &str) 
         serde_json::json!({
             "prompt_chars": args.prompt.len(),
             "files": args.files.len(),
+            "attachments": args.attach_files.len(),
             "model": args.channel.model,
             "status": status,
         }),

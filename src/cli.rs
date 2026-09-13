@@ -189,6 +189,9 @@ pub struct AskArgs {
     /// Files whose contents are prepended as context (repeatable).
     #[arg(long = "file")]
     pub files: Vec<String>,
+    /// Files uploaded to ChatGPT as browser attachments (repeatable).
+    #[arg(long = "attach-file", value_name = "FILE")]
+    pub attach_files: Vec<String>,
     /// Delegation mode: ask (plain text) | plan | review | debug | research.
     /// Non-ask modes send a typed delegation packet and parse a structured reply.
     #[arg(long, value_enum, default_value_t = crate::delegation::Mode::Ask)]
