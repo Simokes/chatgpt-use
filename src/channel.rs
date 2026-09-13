@@ -577,6 +577,18 @@ fn level_index(want: &str) -> Option<usize> {
     LEVEL_ORDER.iter().position(|l| *l == norm)
 }
 
+fn picker_label_matches_level(idx: usize, label: &str) -> bool {
+    let norm = label.trim().to_lowercase();
+    match idx {
+        0 => matches!(norm.as_str(), "instant" | "instantané" | "instantane"),
+        1 => matches!(norm.as_str(), "medium" | "moyen"),
+        2 => matches!(norm.as_str(), "high" | "élevé" | "eleve" | "élevée" | "elevee"),
+        3 => matches!(norm.as_str(), "extra high" | "très élevé" | "tres eleve"),
+        4 => norm == "pro",
+        _ => false,
+    }
+}
+
 // JS: start a fresh chat WITHOUT reloading the page.
 //
 // A full navigation to https://chatgpt.com/ costs 45 backend-api requests on
@@ -2408,6 +2420,12 @@ impl Channel {
             let detail = pick.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
             bail!("could not find the composer model picker: {detail}");
         }
+        if let Some(idx) = want_level {
+            let label = pick.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            if picker_label_matches_level(idx, label) {
+                return Ok(());
+            }
+        }
         let mut st = serde_json::Value::Null;
         let mut opened = false;
         for open_attempt in 0..3 {
@@ -3276,6 +3294,13 @@ mod tests {
         assert_eq!(level_index("GPT-5.5"), None);
         assert_eq!(level_index("Latest"), None);
         assert_eq!(level_index("5.6 Sol"), None);
+    }
+
+    #[test]
+    fn picker_label_can_confirm_current_effort_without_opening_menu() {
+        assert!(picker_label_matches_level(2, "High"));
+        assert!(picker_label_matches_level(2, "Élevé"));
+        assert!(!picker_label_matches_level(2, "Moyen"));
     }
 
     #[test]
