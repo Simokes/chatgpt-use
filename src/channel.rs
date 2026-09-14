@@ -17,6 +17,7 @@
 //! Owned by the CORE agent.
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine;
 use std::fs::File;
 use std::io::{Seek, Write};
 use std::path::PathBuf;
@@ -409,13 +410,17 @@ const JS_COMPOSER_FINGERPRINT: &str = r#"(() => {
 /// beforeinput/input events ProseMirror and React need, so the send button stays
 /// bound to the live content (which is why `fill` was avoided in the first place).
 fn js_insert_text(text: &str) -> String {
-    let t = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    // Never embed arbitrary repository/user text directly in JavaScript source.
+    // Encode UTF-8 bytes here and decode only inside the browser page.
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     format!(
         r#"(() => {{
   const c = document.querySelector('#prompt-textarea');
   if (!c) return JSON.stringify({{ok: false, error: 'composer not found'}});
   c.focus();
-  const ok = document.execCommand('insertText', false, {t});
+  const bytes = Uint8Array.from(atob('{encoded}'), ch => ch.charCodeAt(0));
+  const text = new TextDecoder('utf-8').decode(bytes);
+  const ok = document.execCommand('insertText', false, text);
   return JSON.stringify({{ok}});
 }})()"#
     )
@@ -3265,6 +3270,17 @@ mod tests {
         assert_eq!(composer_fingerprint("a\u{00a0}b"), plain); // NBSP
         assert_eq!(composer_fingerprint("a\u{0085}b"), plain); // NEL — Rust-only in std
         assert_eq!(composer_fingerprint("a\u{feff}b"), plain); // BOM — JS-only in \s
+    }
+
+    #[test]
+    fn js_insert_text_does_not_embed_raw_prompt_content() {
+        let prompt = "`ready` $(echo pwned) \"quoted\" é 中文";
+        let js = js_insert_text(prompt);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(prompt.as_bytes());
+        assert!(js.contains(&encoded));
+        assert!(js.contains("TextDecoder('utf-8')"));
+        assert!(!js.contains(prompt));
+        assert!(!js.contains("$(echo pwned)"));
     }
 
     /// The reason the hash exists at all: chrome-use#301 scrambles chunked
