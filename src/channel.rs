@@ -1327,7 +1327,7 @@ impl Channel {
         // multibyte text). See `js_insert_text` for why this is not `keyboard
         // type`: typed newlines submit, which silently shredded every multi-line
         // prompt into one chat message per line.
-        const INSERT_CHUNK_CHARS: usize = 2_500;
+        const INSERT_CHUNK_CHARS: usize = 1_000;
         let chars: Vec<char> = message.chars().collect();
         for chunk in chars.chunks(INSERT_CHUNK_CHARS) {
             let piece: String = chunk.iter().collect();
