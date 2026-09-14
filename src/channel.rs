@@ -1322,12 +1322,12 @@ impl Channel {
 
         // Insert in bounded chunks. Raw 8k payloads were previously safe, but
         // js_insert_text now base64-encodes text before browser eval (+~33%). Keep
-        // each source chunk at 5k so the encoded JS stays below the measured CDP
+        // each source chunk at 2.5k so the encoded JS stays below the measured CDP
         // timeout boundary. Each chunk appends at the caret. Split on char boundaries.
         // multibyte text). See `js_insert_text` for why this is not `keyboard
         // type`: typed newlines submit, which silently shredded every multi-line
         // prompt into one chat message per line.
-        const INSERT_CHUNK_CHARS: usize = 5_000;
+        const INSERT_CHUNK_CHARS: usize = 2_500;
         let chars: Vec<char> = message.chars().collect();
         for chunk in chars.chunks(INSERT_CHUNK_CHARS) {
             let piece: String = chunk.iter().collect();
