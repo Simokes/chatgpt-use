@@ -68,12 +68,19 @@ fn attach_requested_files(channel: &Channel, args: &AskArgs) -> Result<()> {
     Ok(())
 }
 
+fn connect_for_ask(args: &AskArgs, opts: &ChannelOptions) -> Result<Channel> {
+    match args.conversation_id.as_deref() {
+        Some(id) => Channel::connect_existing(opts, id),
+        None => Channel::connect(opts),
+    }
+}
+
 fn run_ask_mode(args: &AskArgs, mut opts: ChannelOptions) -> Result<()> {
     let message = ask_message(args)?;
     opts.receipt = claim_receipt(args)?;
 
     // Connect, send one turn, print the reply, always close.
-    let reply = Channel::connect(&opts).and_then(|mut channel| {
+    let reply = connect_for_ask(args, &opts).and_then(|mut channel| {
         let reply = attach_requested_files(&channel, args).and_then(|_| channel.send(&message));
         channel.close();
         reply
@@ -124,7 +131,7 @@ fn run_schema_mode(args: &AskArgs, mut opts: ChannelOptions, schema_path: &str) 
         Ok((schema, request)) => {
             {
                 let message = structured::build_message(&request, &schema);
-                match Channel::connect(&opts) {
+                match connect_for_ask(args, &opts) {
                     Err(e) => structured::failure(&e),
                     Ok(mut channel) => {
                         let reply = attach_requested_files(&channel, args).and_then(|_| channel.send(&message));
@@ -231,7 +238,7 @@ fn run_delegation_mode(args: &AskArgs, opts: ChannelOptions) -> Result<()> {
     let message = delegation::build_prompt(args.mode, &args.prompt, &context);
 
     // Connect, send, always close even on error.
-    let mut channel = Channel::connect(&opts)?;
+    let mut channel = connect_for_ask(args, &opts)?;
     let reply_result = channel.send(&message);
     channel.close();
 

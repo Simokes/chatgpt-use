@@ -1606,6 +1606,30 @@ impl Channel {
         self.convo_id.as_deref()
     }
 
+    /// Reopen an existing conversation for another user turn. Unlike `attach`,
+    /// this navigates the browser to the pinned conversation so `send` can safely
+    /// append to the same visible ChatGPT thread.
+    pub fn connect_existing(opts: &ChannelOptions, convo_id: &str) -> Result<Self> {
+        if convo_id.trim().is_empty() {
+            bail!("conversation id cannot be empty");
+        }
+        if opts.temporary {
+            bail!("an existing conversation cannot be reopened as Temporary Chat");
+        }
+        let mut plain = opts.clone();
+        // Existing conversations already own their project membership.
+        plain.project = String::new();
+        plain.temporary = false;
+        let mut chan = Channel::connect(&plain)?;
+        chan.project = opts.project.trim().to_string();
+        chan.convo_id = Some(convo_id.trim().to_string());
+        chan.submitted = false;
+        let budget = opts.timeout_secs.min(90).max(20) as f64;
+        chan.reopen_pinned(budget)
+            .with_context(|| format!("could not reopen conversation {}", convo_id.trim()))?;
+        Ok(chan)
+    }
+
     /// Attach to an existing conversation to read its reply, without typing.
     ///
     /// Opens a plain chat (no project entry, no model change) and uses its tab

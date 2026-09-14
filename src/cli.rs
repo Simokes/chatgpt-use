@@ -211,6 +211,10 @@ pub struct AskArgs {
     /// An id whose request may have reached ChatGPT is never sent again.
     #[arg(long = "request-id", value_name = "ID")]
     pub request_id: Option<String>,
+    /// Append this turn to an existing ChatGPT conversation instead of creating
+    /// a new chat. The conversation is reopened and identity-checked before typing.
+    #[arg(long = "conversation-id", value_name = "ID", conflicts_with = "temporary")]
+    pub conversation_id: Option<String>,
     #[command(flatten)]
     pub channel: ChannelArgs,
 }
