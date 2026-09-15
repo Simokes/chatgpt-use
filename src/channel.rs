@@ -398,33 +398,45 @@ const JS_COMPOSER_FINGERPRINT: &str = r#"(() => {
   return JSON.stringify({n: n, h: h});
 })()"#;
 
-/// JS: insert `text` at the caret via `execCommand('insertText')`.
-///
-/// This is deliberately NOT `keyboard type`. A "\n" typed into ProseMirror is an
-/// Enter — i.e. a SUBMIT — so typing any multi-line message (every `run`/`serve`
-/// system prompt) chopped it at each newline and fired the pieces off as many
-/// separate chat messages, which ChatGPT then answered as fragments. Verified
-/// live: `keyboard type "A\nB"` submits "A" and leaves "B" in the box.
-///
-/// `insertText` treats "\n" as literal text while still firing the real
-/// beforeinput/input events ProseMirror and React need, so the send button stays
-/// bound to the live content (which is why `fill` was avoided in the first place).
-fn js_insert_text(text: &str) -> String {
-    // Never embed arbitrary repository/user text directly in JavaScript source.
-    // Encode UTF-8 bytes here and decode only inside the browser page.
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+/// Stage UTF-8 bytes in small browser-eval payloads, then commit the whole prompt to
+/// ProseMirror in ONE `insertText` transaction. Multiple successive insertText calls can
+/// be acknowledged and still lose/reorder chunks while ProseMirror reconciles them.
+const JS_RESET_COMPOSER_BUFFER: &str = r#"(() => {
+  window.__cguComposerB64 = [];
+  return JSON.stringify({ok: true});
+})()"#;
+
+fn js_stage_composer_bytes(bytes: &[u8]) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     format!(
         r#"(() => {{
-  const c = document.querySelector('#prompt-textarea');
-  if (!c) return JSON.stringify({{ok: false, error: 'composer not found'}});
-  c.focus();
-  const bytes = Uint8Array.from(atob('{encoded}'), ch => ch.charCodeAt(0));
-  const text = new TextDecoder('utf-8').decode(bytes);
-  const ok = document.execCommand('insertText', false, text);
-  return JSON.stringify({{ok}});
+  if (!Array.isArray(window.__cguComposerB64)) window.__cguComposerB64 = [];
+  window.__cguComposerB64.push('{encoded}');
+  return JSON.stringify({{ok: true, parts: window.__cguComposerB64.length}});
 }})()"#
     )
 }
+
+const JS_COMMIT_COMPOSER_BUFFER: &str = r#"(() => {
+  const c = document.querySelector('#prompt-textarea');
+  if (!c) return JSON.stringify({ok: false, error: 'composer not found'});
+  const parts = Array.isArray(window.__cguComposerB64) ? window.__cguComposerB64 : [];
+  try {
+    const chunks = parts.map(p => Uint8Array.from(atob(p), ch => ch.charCodeAt(0)));
+    const total = chunks.reduce((n, b) => n + b.length, 0);
+    const bytes = new Uint8Array(total);
+    let off = 0;
+    for (const chunk of chunks) { bytes.set(chunk, off); off += chunk.length; }
+    const text = new TextDecoder('utf-8', {fatal: true}).decode(bytes);
+    c.focus();
+    const ok = document.execCommand('insertText', false, text);
+    delete window.__cguComposerB64;
+    return JSON.stringify({ok, bytes: total, chars: text.length});
+  } catch (e) {
+    delete window.__cguComposerB64;
+    return JSON.stringify({ok: false, error: String(e)});
+  }
+})()"#;
 
 /// A JS prelude every backend call shares: fetch the page's bearer token ONCE
 /// and keep it on `window` until it is close to expiring.
@@ -1320,53 +1332,99 @@ impl Channel {
             );
         }
 
-        // Insert in bounded chunks. Raw 8k payloads were previously safe, but
-        // js_insert_text now base64-encodes text before browser eval (+~33%). Keep
-        // each source chunk at 2.5k so the encoded JS stays below the measured CDP
-        // timeout boundary. Each chunk appends at the caret. Split on char boundaries.
-        // multibyte text). See `js_insert_text` for why this is not `keyboard
-        // type`: typed newlines submit, which silently shredded every multi-line
-        // prompt into one chat message per line.
-        const INSERT_CHUNK_CHARS: usize = 1_000;
-        let chars: Vec<char> = message.chars().collect();
-        for chunk in chars.chunks(INSERT_CHUNK_CHARS) {
-            let piece: String = chunk.iter().collect();
-            let res = ab_eval(&self.ab, &js_insert_text(&piece), &self.session, budget)
-                .context("inserting message text into composer")?;
-            if !res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                bail!("could not insert text into the ChatGPT composer");
+        // Transport the prompt to the page in bounded base64 chunks, but mutate
+        // ProseMirror only ONCE. The old design called execCommand once per chunk; on
+        // 2026-09-15 a 15k coordinator prompt repeatedly lost thousands of characters
+        // even though every execCommand returned success. One final transaction avoids
+        // that reconciliation race while keeping each browser-eval payload small.
+        const STAGE_CHUNK_BYTES: usize = 1_000;
+        const INSERT_ATTEMPTS: usize = 3;
+        let expected = composer_fingerprint(message);
+        let mut inserted = false;
+        let mut last_seen: Option<(u64, u64)> = None;
+
+        for attempt in 1..=INSERT_ATTEMPTS {
+            if attempt > 1 {
+                let mut empty = false;
+                for _ in 0..5 {
+                    let _ = ab_eval(&self.ab, JS_CLEAR_COMPOSER, &self.session, budget);
+                    if ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget)
+                        .ok()
+                        .and_then(|v| v.get("n").and_then(|n| n.as_u64()))
+                        == Some(0)
+                    {
+                        empty = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                if !empty {
+                    bail!("could not reset the ChatGPT composer before insertion retry");
+                }
             }
+
+            let reset = ab_eval(&self.ab, JS_RESET_COMPOSER_BUFFER, &self.session, budget)
+                .context("resetting staged composer buffer")?;
+            if !reset.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                bail!("could not reset staged composer buffer");
+            }
+
+            let mut staged_ok = true;
+            for chunk in message.as_bytes().chunks(STAGE_CHUNK_BYTES) {
+                let res = ab_eval(
+                    &self.ab,
+                    &js_stage_composer_bytes(chunk),
+                    &self.session,
+                    budget,
+                )
+                .context("staging message bytes for composer")?;
+                if !res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    staged_ok = false;
+                    break;
+                }
+            }
+            if !staged_ok {
+                continue;
+            }
+
+            let commit = ab_eval(&self.ab, JS_COMMIT_COMPOSER_BUFFER, &self.session, budget)
+                .context("committing staged message to composer")?;
+            if !commit.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                eprintln!("composer commit failed on insertion attempt {attempt}/{INSERT_ATTEMPTS}");
+                continue;
+            }
+
+            // React may paint the content shortly after execCommand returns. Require the
+            // exact full fingerprint before Enter; never accept a merely non-empty box.
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(75));
+                if let Ok(v) = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget) {
+                    let n = v.get("n").and_then(|x| x.as_u64());
+                    let h = v.get("h").and_then(|x| x.as_u64());
+                    if let (Some(n), Some(h)) = (n, h) {
+                        last_seen = Some((n, h));
+                        if n == expected.0 && h == expected.1 as u64 {
+                            inserted = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if inserted {
+                break;
+            }
+            eprintln!(
+                "composer fingerprint mismatch after single-transaction insertion attempt {attempt}/{INSERT_ATTEMPTS}; retrying"
+            );
         }
 
-        // Integrity check BEFORE submitting: confirm the whole payload is sitting
-        // in the composer, in the right ORDER. Cheaper and far more useful than
-        // discovering a mangled prompt from a confused reply ten minutes later.
-        //
-        // Both halves matter. The count catches truncation (a chunk that never
-        // landed) and pollution (a restored draft prepended); the hash catches
-        // reordering, which the count cannot see because it preserves length —
-        // and reordering is not hypothetical here, it is what
-        // leeguooooo/chrome-use#301 does to chunked inserts.
-        let (want_n, want_h) = composer_fingerprint(message);
-        let got = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget).ok();
-        let got_n = got.as_ref().and_then(|v| v.get("n")).and_then(|v| v.as_u64());
-        let got_h = got.as_ref().and_then(|v| v.get("h")).and_then(|v| v.as_u64());
-        if let (Some(n), Some(h)) = (got_n, got_h) {
-            if n != want_n {
-                bail!(
-                    "composer content doesn't match the message to send \
-                     ({n} non-whitespace chars present, {want_n} expected) — \
-                     refusing to submit a truncated or polluted prompt"
-                );
-            }
-            if h != want_h as u64 {
-                bail!(
-                    "composer holds the right number of characters ({n}) but not in \
-                     the right order (fingerprint {h:#x}, expected {:#x}) — refusing \
-                     to submit a scrambled prompt",
-                    want_h
-                );
-            }
+        if !inserted {
+            bail!(
+                "composer content could not be made identical after {INSERT_ATTEMPTS} single-transaction attempts \
+                 (got {last_seen:?}, expected n={} h={:#x}) — refusing to submit a truncated, polluted, or scrambled prompt",
+                expected.0,
+                expected.1
+            );
         }
 
         Ok(())
@@ -3274,14 +3332,29 @@ mod tests {
     }
 
     #[test]
-    fn js_insert_text_does_not_embed_raw_prompt_content() {
+    fn js_stage_composer_bytes_does_not_embed_raw_prompt_content() {
         let prompt = "`ready` $(echo pwned) \"quoted\" é 中文";
-        let js = js_insert_text(prompt);
+        let js = js_stage_composer_bytes(prompt.as_bytes());
         let encoded = base64::engine::general_purpose::STANDARD.encode(prompt.as_bytes());
         assert!(js.contains(&encoded));
-        assert!(js.contains("TextDecoder('utf-8')"));
         assert!(!js.contains(prompt));
         assert!(!js.contains("$(echo pwned)"));
+    }
+
+    #[test]
+    fn staged_byte_chunks_round_trip_long_unicode_prompt() {
+        let prompt = format!("{}\n{}\n{}", "A".repeat(7_777), "中文😀".repeat(900), "Z".repeat(6_321));
+        let encoded: Vec<String> = prompt
+            .as_bytes()
+            .chunks(1_000)
+            .map(|b| base64::engine::general_purpose::STANDARD.encode(b))
+            .collect();
+        let mut bytes = Vec::new();
+        for part in encoded {
+            bytes.extend(base64::engine::general_purpose::STANDARD.decode(part).unwrap());
+        }
+        assert_eq!(String::from_utf8(bytes).unwrap(), prompt);
+        assert_eq!(JS_COMMIT_COMPOSER_BUFFER.matches("execCommand('insertText'").count(), 1);
     }
 
     /// The reason the hash exists at all: chrome-use#301 scrambles chunked
