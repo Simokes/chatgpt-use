@@ -86,6 +86,10 @@ pub enum BusyPolicy {
 pub struct WorkArgs {
     /// The task for ChatGPT to carry out on the local project via its connector tools.
     pub task: String,
+    /// Append this work turn to an existing ChatGPT conversation instead of creating
+    /// a new chat. The conversation is reopened and identity-checked before typing.
+    #[arg(long = "conversation-id", value_name = "ID", conflicts_with = "temporary")]
+    pub conversation_id: Option<String>,
     /// If ChatGPT replies without evidence it actually ran the tools (a thin or
     /// hedging report), re-nudge it this many extra times in the same conversation.
     #[arg(long, default_value_t = 1)]

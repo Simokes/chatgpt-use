@@ -56,11 +56,17 @@ pub fn run(args: &WorkArgs) -> Result<()> {
     };
 
     let sopts = SendOptions::work();
-    let mut channel = Channel::connect(&opts)?;
+    let mut channel = match args.conversation_id.as_deref() {
+        Some(id) => Channel::connect_existing(&opts, id)?,
+        None => Channel::connect(&opts)?,
+    };
 
     // Run the dispatch (+ thin-report retries), then optionally keep the loop
-    // going across turns. close() no matter how it ends.
+    // going across turns. Capture the exact conversation id before close() so
+    // callers can resume the same implementation thread after an external
+    // review/correction boundary.
     let result = drive(&mut channel, args, &sopts);
+    let conversation_id = channel.conversation_id().map(str::to_string);
     channel.close();
     let text = result?;
 
@@ -72,6 +78,9 @@ pub fn run(args: &WorkArgs) -> Result<()> {
             "looped": args.r#loop,
         }),
     );
+    if let Some(id) = conversation_id {
+        eprintln!("CHATGPT_CONVERSATION_ID={id}");
+    }
     println!("{text}");
     Ok(())
 }
