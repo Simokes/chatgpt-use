@@ -928,7 +928,7 @@ fn is_windows_git_worktree(cwd: &Path) -> bool {
 
 fn shell_platform_prelude(cwd: &Path) -> &'static str {
     if is_windows_git_worktree(cwd) {
-        "git() { git.exe \"$@\"; }\ngh() { gh.exe \"$@\"; }\npython() { python3 \"$@\"; }\n"
+        "git() { git.exe \"$@\"; }\npython() { python3 \"$@\"; }\n"
     } else {
         ""
     }
@@ -1355,6 +1355,13 @@ mod tests {
         )
         .unwrap();
         assert!(second.contains("/current|unset"), "{second}");
+    }
+
+    #[test]
+    fn windows_shell_prelude_relies_on_canonical_gh_from_path() {
+        let prelude = "git() { git.exe \"$@\"; }\npython() { python3 \"$@\"; }\n";
+        assert!(!prelude.contains("gh.exe"));
+        assert!(!prelude.contains("gh-win"));
     }
 
     #[test]
