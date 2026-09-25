@@ -45,7 +45,10 @@ pub fn run(args: &RefreshArgs) -> Result<()> {
 }
 
 fn do_refresh(channel: &Channel, args: &RefreshArgs) -> Result<()> {
-    let url = args.url.clone().unwrap_or_else(|| DEFAULT_SETTINGS_URL.to_string());
+    let url = args
+        .url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SETTINGS_URL.to_string());
     eprintln!("opening connector settings: {url}");
     channel.open(&url)?;
 
@@ -54,18 +57,31 @@ fn do_refresh(channel: &Channel, args: &RefreshArgs) -> Result<()> {
 
     if ok {
         let conn = res.get("connector").and_then(|s| s.as_str()).unwrap_or("");
-        let rb = res.get("refresh").and_then(|s| s.as_str()).unwrap_or("Refresh");
+        let rb = res
+            .get("refresh")
+            .and_then(|s| s.as_str())
+            .unwrap_or("Refresh");
         eprintln!("opened {conn:?}, clicked {rb:?}");
         eprintln!("refresh: done — ChatGPT re-ran tools/list against the server.");
-        crate::ledger::record("refresh", serde_json::json!({ "connector": args.connector, "ok": true }));
+        crate::ledger::record(
+            "refresh",
+            serde_json::json!({ "connector": args.connector, "ok": true }),
+        );
         return Ok(());
     }
 
-    let step = res.get("step").and_then(|s| s.as_str()).unwrap_or("unknown");
+    let step = res
+        .get("step")
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown");
     let seen: Vec<String> = res
         .get("controls")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
     crate::ledger::record(
         "refresh",
@@ -77,7 +93,11 @@ fn do_refresh(channel: &Channel, args: &RefreshArgs) -> Result<()> {
          Controls I saw: {}",
         args.connector,
         args.connector,
-        if seen.is_empty() { "(none)".into() } else { seen.join(" | ") }
+        if seen.is_empty() {
+            "(none)".into()
+        } else {
+            seen.join(" | ")
+        }
     );
 }
 

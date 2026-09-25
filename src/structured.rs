@@ -137,7 +137,8 @@ fn extract(reply: &str) -> Result<Value, String> {
     }
     let candidate = crate::delegation::extract_json_object(text)
         .ok_or_else(|| "no JSON value found in the reply".to_string())?;
-    serde_json::from_str(&candidate).map_err(|e| format!("the JSON in the reply does not parse: {e}"))
+    serde_json::from_str(&candidate)
+        .map_err(|e| format!("the JSON in the reply does not parse: {e}"))
 }
 
 #[cfg(test)]
@@ -208,19 +209,29 @@ mod tests {
     fn missing_and_mistyped_fields_are_rejected_with_paths() {
         let env = ok(r#"{"status":"completed"}"#);
         assert_eq!(env["status"], "schema_violation");
-        assert!(env["errors"][0]["message"].as_str().unwrap().contains("findings"));
+        assert!(env["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("findings"));
 
-        let env = ok(r#"{"status":"completed","findings":[{"severity":"P9","file":"a","line":"42","summary":"s"}]}"#);
+        let env = ok(
+            r#"{"status":"completed","findings":[{"severity":"P9","file":"a","line":"42","summary":"s"}]}"#,
+        );
         assert_eq!(env["status"], "schema_violation");
-        let paths: Vec<&str> =
-            env["errors"].as_array().unwrap().iter().map(|e| e["path"].as_str().unwrap()).collect();
+        let paths: Vec<&str> = env["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
         assert!(paths.contains(&"/findings/0/severity"), "{paths:?}");
         assert!(paths.contains(&"/findings/0/line"), "{paths:?}");
     }
 
     #[test]
     fn channel_failures_keep_their_kind_and_submission_state() {
-        let incomplete: anyhow::Error = ChannelError::new(ErrorKind::Incomplete, "timed out").into();
+        let incomplete: anyhow::Error =
+            ChannelError::new(ErrorKind::Incomplete, "timed out").into();
         let env = evaluate(Err(incomplete), &review_schema());
         assert_eq!(env["status"], "incomplete");
         assert_eq!(env["error"]["kind"], "incomplete");
@@ -246,8 +257,20 @@ mod tests {
 
     #[test]
     fn only_completed_exits_zero_and_each_status_has_its_own_code() {
-        let statuses =
-            ["completed", "schema_violation", "unparseable", "incomplete", "unavailable", "busy", "schema_error", "duplicate", "submission_unknown", "cancelled", "cancel_requested", "failed"];
+        let statuses = [
+            "completed",
+            "schema_violation",
+            "unparseable",
+            "incomplete",
+            "unavailable",
+            "busy",
+            "schema_error",
+            "duplicate",
+            "submission_unknown",
+            "cancelled",
+            "cancel_requested",
+            "failed",
+        ];
         let codes: Vec<i32> = statuses.iter().map(|s| exit_code(s)).collect();
         assert_eq!(codes.iter().filter(|&&c| c == 0).count(), 1);
         let mut unique = codes.clone();

@@ -25,9 +25,16 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 // Accepted chrome-use binary names, newest name first (mirrors chatgpt-imagegen).
-const AB_BIN_CANDIDATES: &[&str] = &["chrome-use", "agent-browser", "agent-browser-stealth", "abs"];
+const AB_BIN_CANDIDATES: &[&str] = &[
+    "chrome-use",
+    "agent-browser",
+    "agent-browser-stealth",
+    "abs",
+];
 
 const WEB_NEW_CHAT_URL: &str = "https://chatgpt.com/";
+const COMPOSER_SELECTOR: &str =
+    r#"#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]"#;
 /// One shared chrome-use session name — deliberately NOT per-process.
 ///
 /// A different session name is a different tab, so the old `chatgpt-use-<pid>`
@@ -148,7 +155,11 @@ pub struct ChannelError {
 
 impl ChannelError {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
-        ChannelError { kind, submitted: Submitted::No, message: message.into() }
+        ChannelError {
+            kind,
+            submitted: Submitted::No,
+            message: message.into(),
+        }
     }
 
     pub fn with_submitted(mut self, submitted: Submitted) -> Self {
@@ -175,7 +186,11 @@ pub fn channel_error(e: &anyhow::Error) -> Option<&ChannelError> {
 /// takes its `submitted` from the turn, except `Unknown`, which only the
 /// submit step can know and nothing later may downgrade.
 fn classify(mut e: anyhow::Error, submitted: bool) -> anyhow::Error {
-    let phase = if submitted { Submitted::Yes } else { Submitted::No };
+    let phase = if submitted {
+        Submitted::Yes
+    } else {
+        Submitted::No
+    };
     if let Some(ce) = e.downcast_mut::<ChannelError>() {
         if ce.submitted != Submitted::Unknown {
             ce.submitted = phase;
@@ -183,7 +198,10 @@ fn classify(mut e: anyhow::Error, submitted: bool) -> anyhow::Error {
         return e;
     }
     let (kind, label) = if submitted {
-        (ErrorKind::Incomplete, "the prompt was sent but the reply did not complete")
+        (
+            ErrorKind::Incomplete,
+            "the prompt was sent but the reply did not complete",
+        )
     } else {
         (ErrorKind::NotSubmitted, "the prompt was not sent")
     };
@@ -215,7 +233,9 @@ pub fn install_cancel_handler() {
 }
 
 fn cancel_requested() -> bool {
-    CANCEL.get().is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+    CANCEL
+        .get()
+        .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 /// Sleep that wakes early for a cancel.
@@ -259,7 +279,7 @@ const JS_COMPOSER: &str = r#"(() => {
   const dlg = [...document.querySelectorAll('[role="dialog"]')]
     .map(d => d.textContent || '').join(' ');
   return JSON.stringify({
-    composer: !!document.querySelector('#prompt-textarea'),
+    composer: !!document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]'),
     limited: /too many requests|requests too quickly/i.test(dlg),
   });
 })()"#;
@@ -270,49 +290,72 @@ const JS_STATE: &str = r#"(() => {
   const stop = !!document.querySelector(
     'button[data-testid="stop-button"], button[aria-label*="Stop" i]'
   );
-  const a = document.querySelectorAll('[data-message-author-role="assistant"]');
+  const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')];
+  const headingText = h => (h.textContent || '').trim().replace(/\s+/g, ' ');
+
+  const legacyA = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+  const searchA = [...document.querySelectorAll('[data-content-search-unit-key$=":assistant"]')];
+  const headingA = headings
+    .filter(h => /^(chatgpt said|chatgpt a dit)\s*:/i.test(headingText(h)))
+    .map(h => h.parentElement)
+    .filter(Boolean);
+  const a = legacyA.length > 0 ? legacyA : (searchA.length > 0 ? searchA : headingA);
   const lastA = a[a.length - 1];
+  const lastAText = lastA
+    ? (((lastA.querySelector('[data-markdown-text-style="assistant-message"]') || lastA)
+        .innerText || lastA.textContent || '').trim())
+    : '';
+
+  const legacyU = [...document.querySelectorAll('[data-message-author-role="user"]')];
+  const searchU = [...document.querySelectorAll('[data-content-search-unit-key$=":user"]')];
+  const headingU = headings.filter(
+    h => /^(you said|vous avez dit)\s*:/i.test(headingText(h))
+  );
+  const userCount = legacyU.length > 0
+    ? legacyU.length
+    : (searchU.length > 0 ? searchU.length : headingU.length);
+
   const dlg = [...document.querySelectorAll('[role="dialog"]')]
     .map(d => d.textContent || '').join(' ');
-  // A connector turn is multi-step: ChatGPT shows "Calling tool" / "Searching" /
-  // "Running…" indicators while a tool runs (a build/test can take MINUTES). Treat
-  // the turn as still in progress while any such active-tool marker is present, so
-  // we don't scrape an intermediate ("I'll check next…") message instead of the
-  // final report, and so we don't give up mid-build. Match PRESENT-tense action
-  // verbs only — never past-tense "Thought for Xs" / "Worked for Xs", which persist
-  // as static disclosures AFTER the turn ends and would wedge us as forever-active.
-  // IMPORTANT: only scan UI chips (buttons), NOT prose. The progress indicator
-  // ChatGPT shows while a connector tool runs is a button/disclosure whose text
-  // starts with a present-tense action verb ("Running…", "Searching…"). Scanning
-  // <div>/<span> too would also match the assistant's OWN words ("Running cargo
-  // test…", "Reading Cargo.toml…") in the finished answer — which kept the turn
-  // "active" forever and never settled. Verbs are present-progressive only; never
-  // past-tense ("Ran"/"Searched"/"Thought for Xs"), which persist after the turn.
+
   const ACTIVE = /^(calling|searching|running|using|analyzing|analysing|executing|fetching|connecting|generating|working on)\b/i;
   const tool_active = [...document.querySelectorAll('button, [role="button"]')]
-    .filter(b => !b.closest('[data-message-author-role]')) // exclude in-message buttons
+    .filter(b => !b.closest('[data-message-author-role], [data-content-search-unit-key]'))
     .some(b => {
       const t = (b.textContent || '').trim();
       return t.length > 0 && t.length <= 24 && ACTIVE.test(t);
     });
+
   const cm = location.pathname.match(/\/c\/([0-9a-f-]{36})/i);
   return JSON.stringify({
     stop,
     tool_active,
     convo: cm ? cm[1] : "",
-    user_count: document.querySelectorAll('[data-message-author-role="user"]').length,
+    user_count: userCount,
     assistant_count: a.length,
     limited: /too many requests|requests too quickly/i.test(dlg),
-    atext: lastA ? (lastA.innerText || lastA.textContent || '').trim() : ""
+    atext: lastAText
   });
 })()"#;
 
 // JS: scrape the full innerText of the last assistant message.
 const JS_LAST_ASSISTANT: &str = r#"(() => {
-  const a = document.querySelectorAll('[data-message-author-role="assistant"]');
+  const legacy = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+  const search = [...document.querySelectorAll('[data-content-search-unit-key$=":assistant"]')];
+  const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')];
+  const headingBlocks = headings
+    .filter(h => /^(chatgpt said|chatgpt a dit)\s*:/i.test(
+      (h.textContent || '').trim().replace(/\s+/g, ' ')
+    ))
+    .map(h => h.parentElement)
+    .filter(Boolean);
+  const a = legacy.length > 0 ? legacy : (search.length > 0 ? search : headingBlocks);
   const lastA = a[a.length - 1];
   if (!lastA) return JSON.stringify("");
-  return JSON.stringify((lastA.innerText || lastA.textContent || "").trim());
+  const body = lastA.querySelector('[data-markdown-text-style="assistant-message"]') || lastA;
+  let text = (body.innerText || body.textContent || '').trim();
+  text = text.replace(/^(chatgpt said|chatgpt a dit)\s*:\s*/i, '');
+  return JSON.stringify(text.trim());
 })()"#;
 
 // JS: the conversation UUID this tab is currently showing, or "" on a
@@ -328,23 +371,51 @@ const JS_CONVO_ID: &str = r#"(() => {
 // "is the composer empty?", which races React's clear and misreads in both
 // directions.
 const JS_ASSISTANT_COUNT: &str = r#"(() => {
-  const a = document.querySelectorAll('[data-message-author-role="assistant"]');
-  return JSON.stringify(a.length);
+  const legacy = [...document.querySelectorAll('[data-message-author-role="assistant"]')].length;
+  if (legacy > 0) return JSON.stringify(legacy);
+  const search = document.querySelectorAll('[data-content-search-unit-key$=":assistant"]').length;
+  if (search > 0) return JSON.stringify(search);
+  const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')];
+  const count = headings.filter(h => {
+    const t = (h.textContent || '').trim().replace(/\s+/g, ' ');
+    return /^(chatgpt said|chatgpt a dit)\s*:/i.test(t);
+  }).length;
+  return JSON.stringify(count);
 })()"#;
 
 const JS_USER_COUNT: &str = r#"(() => {
-  const u = document.querySelectorAll('[data-message-author-role="user"]');
-  return JSON.stringify(u.length);
+  const legacy = [...document.querySelectorAll('[data-message-author-role="user"]')].length;
+  if (legacy > 0) return JSON.stringify(legacy);
+  const search = document.querySelectorAll('[data-content-search-unit-key$=":user"]').length;
+  if (search > 0) return JSON.stringify(search);
+  const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')];
+  const count = headings.filter(h => {
+    const t = (h.textContent || '').trim().replace(/\s+/g, ' ');
+    return /^(you said|vous avez dit)\s*:/i.test(t);
+  }).length;
+  return JSON.stringify(count);
 })()"#;
 
 // JS: empty the composer, so a leftover fragment from an aborted turn can't be
 // prepended to the next message.
 const JS_CLEAR_COMPOSER: &str = r#"(() => {
-  const c = document.querySelector('#prompt-textarea');
+  const c = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]');
   if (!c) return JSON.stringify({ok: false});
   c.focus();
   document.execCommand('selectAll');
   document.execCommand('delete');
+  return JSON.stringify({ok: true});
+})()"#;
+
+const JS_SUBMIT_COMPOSER: &str = r#"(() => {
+  const composer = document.querySelector(
+    '#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]'
+  );
+  const form = composer && composer.closest('form');
+  if (!form) return JSON.stringify({ok: false, error: 'composer form not found'});
+  const button = form.querySelector('button[type="submit"]:not([disabled])');
+  if (!button) return JSON.stringify({ok: false, error: 'enabled submit button not found'});
+  form.requestSubmit(button);
   return JSON.stringify({ok: true});
 })()"#;
 
@@ -378,7 +449,7 @@ const JS_DISMISS_DIALOG: &str = r#"(() => {
 // complete, correctly sized, and scrambled. FNV-1a over UTF-16 code units, which
 // both sides can compute identically.
 const JS_COMPOSER_FINGERPRINT: &str = r#"(() => {
-  const c = document.querySelector('#prompt-textarea');
+  const c = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]');
   const t = c ? (c.innerText || c.textContent || '') : '';
   const isWs = (u) =>
     (u >= 0x09 && u <= 0x0d) || u === 0x20 || u === 0x85 || u === 0xa0 ||
@@ -418,7 +489,7 @@ fn js_stage_composer_bytes(bytes: &[u8]) -> String {
 }
 
 const JS_COMMIT_COMPOSER_BUFFER: &str = r#"(() => {
-  const c = document.querySelector('#prompt-textarea');
+  const c = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]');
   if (!c) return JSON.stringify({ok: false, error: 'composer not found'});
   const parts = Array.isArray(window.__cguComposerB64) ? window.__cguComposerB64 : [];
   try {
@@ -599,7 +670,10 @@ fn picker_label_matches_level(idx: usize, label: &str) -> bool {
     match idx {
         0 => matches!(norm.as_str(), "instant" | "instantané" | "instantane"),
         1 => matches!(norm.as_str(), "medium" | "moyen"),
-        2 => matches!(norm.as_str(), "high" | "élevé" | "eleve" | "élevée" | "elevee"),
+        2 => matches!(
+            norm.as_str(),
+            "high" | "élevé" | "eleve" | "élevée" | "elevee"
+        ),
         3 => matches!(norm.as_str(), "extra high" | "très élevé" | "tres eleve"),
         4 => norm == "pro",
         _ => false,
@@ -625,7 +699,7 @@ const JS_NEW_CHAT_IN_PLACE: &str = r#"(() => {
   const hit = cands.find(el => {
     const al = (el.getAttribute('aria-label') || '').trim();
     const tx = (el.textContent || '').trim();
-    return /^new chat$/i.test(al) || /^new chat$/i.test(tx);
+    return /^(new chat|nouveau chat)$/i.test(al) || /^(new chat|nouveau chat)$/i.test(tx);
   });
   if (!hit) return JSON.stringify({ok: false, error: 'no new-chat control'});
   hit.click();
@@ -684,31 +758,125 @@ fn js_open_project_in_place(gizmo_id: &str) -> String {
 //
 // Its label tracks the current model and has read "Instant", "5.6 SolLight" and
 // "6Pro" on one account inside three weeks, so any word list goes stale. What is
-// stable is where it sits: the composer toolbar row, identified by the plus
-// button's testid, holding exactly one other `aria-haspopup="menu"` button.
+// stable is its relationship to the active composer. Project root, blank chat,
+// and existing conversations move the composer, so never use page-global position.
+const EFFORT_SHORTCUT: &str = "Control+Shift+M";
+
+// JS: locate the active composer's intelligence picker without using page-global
+// coordinates. The composer moves between project root, blank chat, and an
+// existing conversation; the trailing slot is stable across those layouts.
 const JS_FIND_PICKER: &str = r#"(() => {
-  const plus = document.querySelector('[data-testid="composer-plus-btn"]');
-  if (!plus) return JSON.stringify({ok: false, error: 'composer toolbar not found'});
-  const rowTop = plus.getBoundingClientRect().top;
-  const hits = [...document.querySelectorAll('button[aria-haspopup="menu"]')].filter(b => {
-    if (b.getAttribute('data-testid') === 'composer-plus-btn') return false;
-    if (b.hasAttribute('data-trailing-button')) return false;
-    const r = b.getBoundingClientRect();
-    return r.width > 0 && r.height > 0 && Math.abs(r.top - rowTop) < 6;
-  });
-  if (hits.length !== 1) {
-    return JSON.stringify({ok: false,
-      error: 'expected one model picker on the composer row, found ' + hits.length});
+  const composer = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]');
+  const form = composer && composer.closest('form');
+  let hit = document.querySelector('button[data-codex-intelligence-trigger="true"]');
+  if (!hit && form) {
+    const hits = [...form.querySelectorAll('button[aria-haspopup="menu"]')].filter(b => {
+      if (b.hasAttribute('data-trailing-button')) return false;
+      const r = b.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    });
+    if (hits.length === 1) hit = hits[0];
   }
-  const r = hits[0].getBoundingClientRect();
-  return JSON.stringify({ok: true, label: (hits[0].textContent || '').trim(),
-                         x: Math.round(r.left + r.width / 2),
-                         y: Math.round(r.top + r.height / 2)});
+  if (!hit) {
+    return JSON.stringify({ok: false, error: 'composer intelligence trigger not found'});
+  }
+  const r = hit.getBoundingClientRect();
+  return JSON.stringify({
+    ok: true,
+    label: (hit.textContent || '').trim(),
+    effort: hit.getAttribute('data-selected-reasoning-effort') || '',
+    expanded: hit.getAttribute('aria-expanded') === 'true',
+    x: Math.round(r.left + r.width / 2),
+    y: Math.round(r.top + r.height / 2)
+  });
 })()"#;
+
+const JS_OPEN_PICKER: &str = r#"(() => {
+  const b = document.querySelector('button[data-codex-intelligence-trigger="true"]')
+    || (() => {
+      const composer = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]');
+      const form = composer && composer.closest('form');
+      if (!form) return null;
+      const hits = [...form.querySelectorAll('button[aria-haspopup="menu"]')].filter(x => {
+        if (x.hasAttribute('data-trailing-button')) return false;
+        const r = x.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      return hits.length === 1 ? hits[0] : null;
+    })();
+  if (!b) return JSON.stringify({ok: false, error: 'composer intelligence trigger not found'});
+  if (b.getAttribute('aria-expanded') === 'true') {
+    return JSON.stringify({ok: true, already_open: true});
+  }
+  b.dispatchEvent(new PointerEvent('pointerdown', {
+    bubbles: true, cancelable: true, composed: true,
+    pointerType: 'mouse', button: 0, buttons: 1, isPrimary: true
+  }));
+  return JSON.stringify({ok: true, already_open: false});
+})()"#;
+
+fn js_set_slider_index(target: i64) -> String {
+    format!(
+        r#"(() => {{
+  const target = {target};
+  const s = document.querySelector('[role="slider"]');
+  if (!s) return JSON.stringify({{ok: false, error: 'thinking-effort slider not found'}});
+  const min = Number(s.getAttribute('aria-valuemin'));
+  const max = Number(s.getAttribute('aria-valuemax'));
+  const before = Number(s.getAttribute('aria-valuenow'));
+  if (!Number.isFinite(min) || !Number.isFinite(max) || target < min || target > max || max <= min) {{
+    return JSON.stringify({{ok: false, error: 'invalid slider bounds', min, max, target}});
+  }}
+  const root = s.parentElement && s.parentElement.parentElement;
+  if (!root) return JSON.stringify({{ok: false, error: 'slider root not found'}});
+  const rr = root.getBoundingClientRect();
+  const tr = s.getBoundingClientRect();
+  const pad = Math.min(rr.width / 2, tr.width / 2);
+  const usable = Math.max(1, rr.width - pad * 2);
+  const fraction = (target - min) / (max - min);
+  const x = rr.left + pad + fraction * usable;
+  const y = rr.top + rr.height / 2;
+  const base = {{
+    bubbles: true, cancelable: true, composed: true,
+    pointerType: 'mouse', pointerId: 1, isPrimary: true,
+    clientX: x, clientY: y
+  }};
+  root.dispatchEvent(new PointerEvent('pointerdown', {{...base, button: 0, buttons: 1}}));
+  root.dispatchEvent(new PointerEvent('pointermove', {{...base, button: -1, buttons: 1}}));
+  root.dispatchEvent(new PointerEvent('pointerup', {{...base, button: 0, buttons: 0}}));
+  return JSON.stringify({{ok: true, before, target, x: Math.round(x), y: Math.round(y)}});
+}})()"#
+    )
+}
+
 
 // JS: read the opened picker — the effort slider (index + thumb position) and
 // the model-family radios. `level` is the name the page currently shows for the
 // slider position; it is for logging only, never for matching.
+const JS_CURRENT_MODEL_CONFIG: &str = r#"(() => {
+  try {
+    const raw = localStorage.getItem('oai/apps/tpp/last-started-model-config');
+    const cfg = raw ? JSON.parse(raw) : null;
+    return JSON.stringify({modelSlug: cfg?.modelSlug || '', thinkingEffort: cfg?.thinkingEffort || ''});
+  } catch (_) {
+    return JSON.stringify({modelSlug: '', thinkingEffort: ''});
+  }
+})()"#;
+
+fn normalize_model_family(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn model_family_matches_state(want: &str, slug: &str) -> bool {
+    let want = normalize_model_family(want);
+    let slug = normalize_model_family(slug);
+    !want.is_empty() && (slug == want || slug.starts_with(&want))
+}
+
 const JS_PICKER_MENU: &str = r#"(() => {
   const menu = document.querySelector('[role="menu"]');
   const sl = document.querySelector('[role="slider"]');
@@ -829,7 +997,10 @@ pub struct SendOptions {
 impl Default for SendOptions {
     fn default() -> Self {
         // One-shot defaults: ~4s of unchanged text confirms; ~60s of silence aborts.
-        SendOptions { stable_needed: 2, idle_limit: 30 }
+        SendOptions {
+            stable_needed: 2,
+            idle_limit: 30,
+        }
     }
 }
 
@@ -839,7 +1010,10 @@ impl SendOptions {
     /// silence before the safety net fires (the wall-clock `timeout_secs` is the
     /// real ceiling).
     pub fn work() -> Self {
-        SendOptions { stable_needed: 3, idle_limit: 90 }
+        SendOptions {
+            stable_needed: 3,
+            idle_limit: 90,
+        }
     }
 }
 
@@ -956,14 +1130,16 @@ impl Channel {
             // gave a page whose composer never appeared, and an unchanged rerun
             // seconds later worked. So a candidate whose page merely failed to
             // render gets one more try before we move on.
-            let mut opened_now = try_open(&ab, &session, WEB_NEW_CHAT_URL, prof.as_deref(), deadline);
+            let mut opened_now =
+                try_open(&ab, &session, WEB_NEW_CHAT_URL, prof.as_deref(), deadline);
             if matches!(opened_now, Ok(false)) {
                 let (login, what) = page_probe(&ab, &session);
                 if !login {
                     eprintln!("the ChatGPT page never showed its composer ({what}); retrying once");
                     ab_close(&ab, &session);
                     std::thread::sleep(Duration::from_secs(3));
-                    opened_now = try_open(&ab, &session, WEB_NEW_CHAT_URL, prof.as_deref(), deadline);
+                    opened_now =
+                        try_open(&ab, &session, WEB_NEW_CHAT_URL, prof.as_deref(), deadline);
                 }
             }
             match opened_now {
@@ -988,7 +1164,9 @@ impl Channel {
                     ab_close(&ab, &session);
                     let msg = e.to_string();
                     if msg.contains("rate-limited") || msg.contains("Too many") {
-                        return Err(ChannelError::new(ErrorKind::RateLimited, RATE_LIMIT_MSG).into());
+                        return Err(
+                            ChannelError::new(ErrorKind::RateLimited, RATE_LIMIT_MSG).into()
+                        );
                     }
                     // A chrome-use session name can go temporarily unusable: a
                     // command that runs too long is judged unresponsive and its
@@ -1003,8 +1181,10 @@ impl Channel {
                     // chatgpt.com" tells the user to fix the one thing that is
                     // not broken. Say what happened and give a way through now.
                     if msg.contains("session unresponsive") || msg.contains("stuck") {
-                        return Err(ChannelError::new(ErrorKind::SessionUnavailable, format!(
-                            "the chrome-use session {session:?} is wedged — every command on \
+                        return Err(ChannelError::new(
+                            ErrorKind::SessionUnavailable,
+                            format!(
+                                "the chrome-use session {session:?} is wedged — every command on \
                              that name is returning \"session unresponsive\". You are still \
                              signed in; this is not a login problem.\n\n  Use another name \
                              meanwhile:  chatgpt-use <cmd> --session chatgpt-web-2\n\n\
@@ -1012,7 +1192,8 @@ impl Channel {
                              `keyboard inserttext`, say) being judged unresponsive. The name \
                              frees itself later — about an hour, in the case we measured — so \
                              the original is worth retrying rather than abandoning."
-                        ))
+                            ),
+                        )
                         .into());
                     }
                     // other errors: log and try the next candidate
@@ -1050,7 +1231,11 @@ impl Channel {
             ab,
             session,
             timeout_secs,
-            project: if opts.temporary { String::new() } else { opts.project.trim().to_string() },
+            project: if opts.temporary {
+                String::new()
+            } else {
+                opts.project.trim().to_string()
+            },
             convo_id: None,
             pending_project: None,
             submitted: false,
@@ -1060,7 +1245,11 @@ impl Channel {
 
         // Navigate into a ChatGPT Project FIRST — it loads a new page and would
         // reset any model selection, so model selection must come afterwards.
-        let project = if opts.temporary { String::new() } else { opts.project.trim().to_string() };
+        let project = if opts.temporary {
+            String::new()
+        } else {
+            opts.project.trim().to_string()
+        };
         if !project.is_empty() {
             let proj_deadline = Instant::now() + Duration::from_secs(timeout_secs);
             match chan.resolve_project(&project, proj_deadline) {
@@ -1080,8 +1269,13 @@ impl Channel {
                         );
                         chan.pending_project = Some(gizmo);
                         let restore_deadline = Instant::now() + Duration::from_secs(30);
-                        let _ =
-                            ab_open(&chan.ab, &chan.session, WEB_NEW_CHAT_URL, None, restore_deadline);
+                        let _ = ab_open(
+                            &chan.ab,
+                            &chan.session,
+                            WEB_NEW_CHAT_URL,
+                            None,
+                            restore_deadline,
+                        );
                         let _ = wait_composer(&chan.ab, &chan.session, restore_deadline, 15);
                     }
                 }
@@ -1115,36 +1309,41 @@ impl Channel {
                 let mut parts = spec.splitn(2, '\t');
                 let family = parts.next().unwrap_or("");
                 let effort = parts.next().unwrap_or("");
-                [family, effort].into_iter().filter(|s| !s.is_empty()).collect()
+                [family, effort]
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect()
             } else {
                 vec![model.as_str()]
             };
 
             for selection in selections {
                 let model_deadline = Instant::now() + Duration::from_secs(timeout_secs.min(30));
-                chan.select_model(selection, model_deadline).with_context(|| {
-                    format!(
-                        "could not select requested model setting {selection:?} — refusing \
+                chan.select_model(selection, model_deadline)
+                    .with_context(|| {
+                        format!(
+                            "could not select requested model setting {selection:?} — refusing \
                          to run with a different ChatGPT model or thinking effort"
-                    )
-                })?;
+                        )
+                    })?;
             }
         }
 
-
         if opts.temporary {
             let temporary_deadline = Instant::now() + Duration::from_secs(timeout_secs.min(20));
-            chan.ensure_temporary_chat(temporary_deadline).with_context(|| {
-                "could not confirm ChatGPT Temporary Chat — refusing to submit in a normal chat"
-            })?;
+            chan.ensure_temporary_chat(temporary_deadline)
+                .with_context(|| {
+                    "could not confirm ChatGPT Temporary Chat — refusing to submit in a normal chat"
+                })?;
         }
-
 
         Ok(chan)
     }
 
     fn temporary_chat_mode(&self, budget: f64) -> Result<Option<bool>> {
-        let state = ab_eval(&self.ab, r#"(() => {
+        let state = ab_eval(
+            &self.ab,
+            r#"(() => {
           const uses = [...document.querySelectorAll('use')];
           const find = name => uses.find(x => (x.getAttribute('href') || '').endsWith(name));
           const visible = u => {
@@ -1155,7 +1354,10 @@ impl Channel {
           };
           const url = new URL(location.href);
           return JSON.stringify({ query: url.searchParams.get('temporary-chat'), normal: visible(find('#chat-temp')), checked: visible(find('#chat-temp-checked')) });
-        })()"#, &self.session, budget)?;
+        })()"#,
+            &self.session,
+            budget,
+        )?;
         let query_on = state.get("query").and_then(|v| v.as_str()) == Some("true");
         let normal = state.get("normal").and_then(|v| v.as_bool());
         let checked = state.get("checked").and_then(|v| v.as_bool());
@@ -1167,13 +1369,18 @@ impl Channel {
     }
 
     fn click_temporary_toggle(&self, budget: f64) -> Result<()> {
-        let click = ab_eval(&self.ab, r#"(() => {
+        let click = ab_eval(
+            &self.ab,
+            r#"(() => {
           const use = [...document.querySelectorAll('use')].find(x => (x.getAttribute('href') || '').endsWith('#chat-temp'));
           const button = use && use.closest('button');
           if (!button) return JSON.stringify({ clicked: false });
           button.click();
           return JSON.stringify({ clicked: true });
-        })()"#, &self.session, budget)?;
+        })()"#,
+            &self.session,
+            budget,
+        )?;
         if click.get("clicked").and_then(|v| v.as_bool()) == Some(true) {
             Ok(())
         } else {
@@ -1217,23 +1424,36 @@ impl Channel {
     }
 
     pub fn attach_file(&self, path: &str) -> Result<()> {
-        let name = path.rsplit(|c: char| c == '/' || c == '\\').next().unwrap_or(path);
+        let name = path
+            .rsplit(|c: char| c == '/' || c == '\\')
+            .next()
+            .unwrap_or(path);
         if name.trim().is_empty() {
             bail!("attachment path has no file name");
         }
-        ab_cmd(&self.ab, &["upload", "#upload-files", path], &self.session, 30.0)
-            .with_context(|| format!("uploading attachment {name:?}"))?;
+        ab_cmd(
+            &self.ab,
+            &["upload", r#"form input[type="file"][multiple]:not([accept*="image"])"#, path],
+            &self.session,
+            30.0,
+        )
+        .with_context(|| format!("uploading attachment {name:?}"))?;
         let target = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_string());
-        let js = format!(r#"(() => {{
+        let js = format!(
+            r#"(() => {{
           const target = {target};
           const present = [...document.querySelectorAll('button')]
             .some(b => (b.textContent || '').trim() === target || b.getAttribute('aria-label') === target);
           return JSON.stringify({{present}});
-        }})()"#);
+        }})()"#
+        );
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
-            if ab_eval(&self.ab, &js, &self.session, 8.0).ok()
-                .and_then(|v| v.get("present").and_then(|x| x.as_bool())) == Some(true) {
+            if ab_eval(&self.ab, &js, &self.session, 8.0)
+                .ok()
+                .and_then(|v| v.get("present").and_then(|x| x.as_bool()))
+                == Some(true)
+            {
                 eprintln!("attached file: {name}");
                 return Ok(());
             }
@@ -1274,7 +1494,9 @@ impl Channel {
                 .filter(|v| v.is_object())
                 .map(|v| {
                     v.get("stop").and_then(|b| b.as_bool()).unwrap_or(false)
-                        || v.get("tool_active").and_then(|b| b.as_bool()).unwrap_or(false)
+                        || v.get("tool_active")
+                            .and_then(|b| b.as_bool())
+                            .unwrap_or(false)
                 })
                 .unwrap_or(false)
         };
@@ -1295,7 +1517,9 @@ impl Channel {
             // help; reloading the conversation does. This is the same trade the
             // rest of the channel makes: the record is authoritative, the page
             // is just a keyboard, and a keyboard that has locked up gets reset.
-            eprintln!("the page is stuck mid-generation; reloading the conversation to free the composer");
+            eprintln!(
+                "the page is stuck mid-generation; reloading the conversation to free the composer"
+            );
             if self.convo_id.is_some() {
                 self.reopen_pinned(budget)
                     .context("reloading a page stuck mid-generation")?;
@@ -1304,8 +1528,13 @@ impl Channel {
         }
 
         // Focus and empty the composer, then insert the message as TEXT.
-        ab_cmd(&self.ab, &["click", "#prompt-textarea"], &self.session, budget)
-            .context("clicking #prompt-textarea")?;
+        ab_cmd(
+            &self.ab,
+            &["click", COMPOSER_SELECTOR],
+            &self.session,
+            budget,
+        )
+        .context("clicking ChatGPT composer")?;
         // Clear, then CONFIRM the composer is actually empty. One `delete` is not
         // enough after a reattach: the page may still be hydrating, and ChatGPT
         // restores a saved draft into the composer once it is — which silently
@@ -1390,7 +1619,9 @@ impl Channel {
             let commit = ab_eval(&self.ab, JS_COMMIT_COMPOSER_BUFFER, &self.session, budget)
                 .context("committing staged message to composer")?;
             if !commit.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                eprintln!("composer commit failed on insertion attempt {attempt}/{INSERT_ATTEMPTS}");
+                eprintln!(
+                    "composer commit failed on insertion attempt {attempt}/{INSERT_ATTEMPTS}"
+                );
                 continue;
             }
 
@@ -1445,20 +1676,33 @@ impl Channel {
         // with an already-cleared box looked like success (→ we then waited on,
         // and scraped, the PREVIOUS turn).
         if !self.await_user_turn(baseline_users, Duration::from_secs(3), budget) {
-            // Enter didn't take. Click the send button and demand evidence again.
-            // Note this fallback is naturally inert if the submit did land after
-            // all: once generation starts, the send button becomes the stop
-            // button and this selector matches nothing.
-            let _ = ab_cmd(
+            // Enter didn't take. Submit through the composer's owning form.
+            // Current ChatGPT ignores synthetic button clicks but accepts the
+            // form's native requestSubmit() path.
+            let submitted = ab_eval(
                 &self.ab,
-                &["click", r#"button[data-testid="send-button"]"#],
+                JS_SUBMIT_COMPOSER,
                 &self.session,
                 budget,
-            );
+            )
+            .ok()
+            .and_then(|v| v.get("ok").and_then(|x| x.as_bool()))
+            == Some(true);
+
+            if !submitted {
+                // Compatibility fallback for older surfaces.
+                let _ = ab_cmd(
+                    &self.ab,
+                    &["click", r#"button[data-testid="send-button"]"#],
+                    &self.session,
+                    budget,
+                );
+            }
+
             if !self.await_user_turn(baseline_users, Duration::from_secs(5), budget) {
                 return Err(SubmitFailure::Ambiguous(anyhow!(
                     "the message was never submitted — no new user turn appeared \
-                     after pressing Enter and clicking the send button. The \
+                     after pressing Enter and submitting the composer form. The \
                      composer may be disabled (rate limit, expired session) or \
                      the page layout changed."
                 )));
@@ -1509,7 +1753,10 @@ impl Channel {
         if res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
             return Ok(());
         }
-        let detail = res.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let detail = res
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
 
         // This is the one place a remembered gizmo id gets tested against the
         // server, so it is where a stale one has to be dropped. A project that
@@ -1542,7 +1789,9 @@ impl Channel {
     /// the multi-turn modes rely on context accumulated in the pinned chat, so
     /// answering from a different one is worse than erroring.
     fn verify_convo(&self, budget: f64) -> Result<()> {
-        let Some(ref pinned) = self.convo_id else { return Ok(()) };
+        let Some(ref pinned) = self.convo_id else {
+            return Ok(());
+        };
         if convo_drift(pinned, self.current_convo_id(budget).as_deref()).is_none() {
             return Ok(());
         }
@@ -1889,10 +2138,15 @@ impl Channel {
 
         // Snapshot the current number of assistant messages so we can detect
         // when a NEW one arrives.
-        let baseline_count: u64 = ab_eval(&self.ab, JS_ASSISTANT_COUNT, &self.session, remaining_secs())
-            .ok()
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+        let baseline_count: u64 = ab_eval(
+            &self.ab,
+            JS_ASSISTANT_COUNT,
+            &self.session,
+            remaining_secs(),
+        )
+        .ok()
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
         // Fill + submit, with ONE reattach-and-retry: the tab can vanish between
         // turns (closed, crashed, browser restarted) and the conversation itself
@@ -1948,10 +2202,15 @@ impl Channel {
         // Re-read the assistant baseline: if we reattached above, the reloaded
         // page reflects the server's view and the pre-crash count is meaningless.
         let baseline_count = baseline_count.min(
-            ab_eval(&self.ab, JS_ASSISTANT_COUNT, &self.session, remaining_secs())
-                .ok()
-                .and_then(|v| v.as_u64())
-                .unwrap_or(baseline_count),
+            ab_eval(
+                &self.ab,
+                JS_ASSISTANT_COUNT,
+                &self.session,
+                remaining_secs(),
+            )
+            .ok()
+            .and_then(|v| v.as_u64())
+            .unwrap_or(baseline_count),
         );
 
         // Poll until the stop button is gone AND a new assistant message count
@@ -1975,6 +2234,16 @@ impl Channel {
         // navigation hiccup and reads as "the tab is gone".
         const LOST_POLLS_BEFORE_REATTACH: u32 = 3;
         let mut lost_polls = 0u32;
+
+        // `lost_polls` resets to 0 after every reattach, so on its own it never
+        // bounds how many TIMES this turn reattaches - if reopen_pinned keeps
+        // "succeeding" but the page still never shows our submit landing (e.g.
+        // the message never actually reached the server), the turn would poll
+        // and reattach silently for the entire `self.timeout_secs` budget
+        // before finally failing with a generic timeout. Cap the total across
+        // this turn and fail fast with a specific diagnostic instead.
+        const MAX_REATTACHES_PER_TURN: u32 = 3;
+        let mut total_reattaches = 0u32;
 
         // How often to ask the server instead of the page. Every 10th ~2s poll.
         const SERVER_CHECK_EVERY: u64 = 10;
@@ -2065,6 +2334,16 @@ impl Channel {
                 if self.convo_id.is_some() {
                     lost_polls += 1;
                     if lost_polls >= LOST_POLLS_BEFORE_REATTACH {
+                        total_reattaches += 1;
+                        if total_reattaches > MAX_REATTACHES_PER_TURN {
+                            bail!(
+                                "reattached to the pinned conversation {} times this turn and \
+                                 still never observed the submitted message land (user turn \
+                                 count never rose above {baseline_users}); giving up instead of \
+                                 polling silently until the {}s timeout",
+                                total_reattaches - 1, self.timeout_secs,
+                            );
+                        }
                         self.reopen_pinned(remaining_secs())
                             .context("lost the ChatGPT tab and could not reattach")?;
                         lost_polls = 0;
@@ -2097,6 +2376,15 @@ impl Channel {
                 (Some(_), _) => {
                     lost_polls += 1;
                     if lost_polls >= LOST_POLLS_BEFORE_REATTACH {
+                        total_reattaches += 1;
+                        if total_reattaches > MAX_REATTACHES_PER_TURN {
+                            bail!(
+                                "reattached to the pinned conversation {} times this turn and \
+                                 the page still never settled on it; giving up instead of \
+                                 polling silently until the {}s timeout",
+                                total_reattaches - 1, self.timeout_secs,
+                            );
+                        }
                         self.reopen_pinned(remaining_secs())
                             .context("lost the ChatGPT tab and could not reattach")?;
                         lost_polls = 0;
@@ -2147,7 +2435,9 @@ impl Channel {
                 nap(backoff);
                 if let Some(text) = self.server_verdict(remaining_secs().min(30.0))? {
                     if !text.trim().is_empty() {
-                        eprintln!("the turn completed despite the throttle; taking it from the record");
+                        eprintln!(
+                            "the turn completed despite the throttle; taking it from the record"
+                        );
                         return self.finish_turn(text, remaining_secs());
                     }
                 }
@@ -2155,7 +2445,10 @@ impl Channel {
             }
 
             let stop = st.get("stop").and_then(|v| v.as_bool()).unwrap_or(false);
-            let tool_active = st.get("tool_active").and_then(|v| v.as_bool()).unwrap_or(false);
+            let tool_active = st
+                .get("tool_active")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let cur_count = st
                 .get("assistant_count")
                 .and_then(|v| v.as_u64())
@@ -2197,7 +2490,10 @@ impl Channel {
                 } else {
                     "waiting for reply"
                 };
-                eprintln!("[{elapsed:5}.0s] {phase} (msgs={cur_count}, len={})", atext.len());
+                eprintln!(
+                    "[{elapsed:5}.0s] {phase} (msgs={cur_count}, len={})",
+                    atext.len()
+                );
             }
 
             if !atext.is_empty() {
@@ -2263,16 +2559,11 @@ impl Channel {
         }
 
         // Scrape the last assistant message — prefer innerText (rendered markdown).
-        let reply_text = ab_eval(
-            &self.ab,
-            JS_LAST_ASSISTANT,
-            &self.session,
-            remaining_secs(),
-        )
-        .ok()
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| last_atext.clone());
+        let reply_text = ab_eval(&self.ab, JS_LAST_ASSISTANT, &self.session, remaining_secs())
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| last_atext.clone());
 
         self.finish_turn(reply_text, remaining_secs())
     }
@@ -2431,7 +2722,7 @@ impl Channel {
             r#"(() => {{
   const gid = {gid};
   return JSON.stringify({{
-    composer: !!document.querySelector('#prompt-textarea'),
+    composer: !!document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable=\"true\"][role=\"textbox\"]'),
     in_project: (location.href || '').includes(gid),
   }});
 }})()"#,
@@ -2442,9 +2733,20 @@ impl Channel {
             if Instant::now() >= deadline {
                 break;
             }
-            if let Ok(st) = ab_eval(&self.ab, &js_project_ready, &self.session, remaining().min(20.0)) {
-                let composer = st.get("composer").and_then(|v| v.as_bool()).unwrap_or(false);
-                let in_project = st.get("in_project").and_then(|v| v.as_bool()).unwrap_or(false);
+            if let Ok(st) = ab_eval(
+                &self.ab,
+                &js_project_ready,
+                &self.session,
+                remaining().min(20.0),
+            ) {
+                let composer = st
+                    .get("composer")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let in_project = st
+                    .get("in_project")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if composer && in_project {
                     ready = true;
                     break;
@@ -2471,16 +2773,15 @@ impl Channel {
     ///     line-up. We locate it structurally instead: the one
     ///     `button[aria-haspopup="menu"]` sharing the composer toolbar row with
     ///     `[data-testid="composer-plus-btn"]` (excluding the plus button).
-    ///   * The five intelligence levels are NO LONGER menu items. They are a
-    ///     `[role="slider"]` with `aria-valuenow` 0..4 — Instant, Medium, High,
-    ///     Extra High, Pro — driven with arrow keys. So we verify on the INDEX,
-    ///     which is stable, never on the rendered name, which is not.
+    ///   * Intelligence levels are a `[role="slider"]`; its available maximum is
+    ///     account/plan dependent. We verify the requested INDEX against live ARIA
+    ///     values, never against the rendered/localized label.
     ///   * Model family is a separate axis: `[role="menuitemradio"]` entries
     ///     ("Latest", "GPT-5.6 Sol", "GPT-5.5"). A `--model` that isn't a level
     ///     name is matched against those.
     ///
-    /// Two clicks must be REAL input events, not `element.click()`: opening the
-    /// picker, and focusing the slider thumb. JS clicks are ignored by both.
+    /// The picker is opened through ChatGPT's keyboard shortcut first, which is
+    /// invariant to composer placement; pointer geometry is only a bounded fallback.
     fn select_model(&self, model: &str, deadline: Instant) -> Result<()> {
         let remaining = || {
             deadline
@@ -2509,8 +2810,17 @@ impl Channel {
             bail!("could not find the composer model picker: {detail}");
         }
         if let Some(idx) = want_level {
+            let effort = pick.get("effort").and_then(|v| v.as_str()).unwrap_or("");
+            let effort_match = match (idx, effort) {
+                (0, "instant") | (0, "low") => true,
+                (1, "medium") => true,
+                (2, "high") => true,
+                (3, "extra_high") | (3, "xhigh") => true,
+                (4, "pro") => true,
+                _ => false,
+            };
             let label = pick.get("label").and_then(|v| v.as_str()).unwrap_or("");
-            if picker_label_matches_level(idx, label) {
+            if effort_match || picker_label_matches_level(idx, label) {
                 return Ok(());
             }
         }
@@ -2520,20 +2830,28 @@ impl Channel {
             if open_attempt > 0 {
                 pick = ab_eval(&self.ab, JS_FIND_PICKER, &self.session, remaining())?;
             }
-            let (px, py) = match (
-                pick.get("x").and_then(|v| v.as_i64()),
-                pick.get("y").and_then(|v| v.as_i64()),
-            ) {
-                (Some(x), Some(y)) => (x, y),
-                _ => bail!("composer model picker has no usable coordinates"),
-            };
-            ab_cmd(
-                &self.ab,
-                &["click", &px.to_string(), &py.to_string()],
-                &self.session,
-                remaining(),
+            let opened_by_pointer = ab_eval(
+                &self.ab, JS_OPEN_PICKER, &self.session, remaining(),
             )
-            .context("opening the composer model picker")?;
+            .ok()
+            .and_then(|v| v.get("ok").and_then(|x| x.as_bool()))
+            == Some(true);
+            if !opened_by_pointer {
+                let (px, py) = match (
+                    pick.get("x").and_then(|v| v.as_i64()),
+                    pick.get("y").and_then(|v| v.as_i64()),
+                ) {
+                    (Some(x), Some(y)) => (x, y),
+                    _ => bail!("composer model picker has no usable coordinates"),
+                };
+                ab_cmd(
+                    &self.ab,
+                    &["click", &px.to_string(), &py.to_string()],
+                    &self.session,
+                    remaining(),
+                )
+                .context("opening the composer model picker")?;
+            }
 
             for _ in 0..6 {
                 std::thread::sleep(Duration::from_millis(250));
@@ -2563,7 +2881,9 @@ impl Channel {
         outcome
     }
 
-    /// Walk the thinking-effort slider to `idx` with arrow keys.
+    /// Move the thinking-effort slider to `idx` through the actual Radix
+    /// pointer interaction. The current thumb is aria-hidden/tabindex=-1, so
+    /// keyboard arrows no longer reach it reliably.
     fn set_level(
         &self,
         st: &serde_json::Value,
@@ -2577,7 +2897,6 @@ impl Channel {
                  account default."
             )
         })?;
-        let now = slider.get("now").and_then(|v| v.as_i64()).unwrap_or(-1);
         let max = slider.get("max").and_then(|v| v.as_i64()).unwrap_or(-1);
         let last = (LEVEL_ORDER.len() - 1) as i64;
         if max > last || idx as i64 > max {
@@ -2589,48 +2908,51 @@ impl Channel {
                 LEVEL_ORDER.join(", ")
             );
         }
-        let (tx, ty) = match (
-            slider.get("thumbX").and_then(|v| v.as_i64()),
-            slider.get("thumbY").and_then(|v| v.as_i64()),
-        ) {
-            (Some(x), Some(y)) => (x, y),
-            _ => bail!("the thinking-effort slider has no usable thumb coordinates"),
-        };
-
-        // A real click on the thumb; this focuses the slider WITHOUT closing the
-        // menu, which `press --selector` does not manage (focusing through a
-        // selector dismisses the popover and the arrow keys go nowhere).
-        ab_cmd(&self.ab, &["click", &tx.to_string(), &ty.to_string()], &self.session, remaining())
-            .context("focusing the thinking-effort slider")?;
-        std::thread::sleep(Duration::from_millis(300));
 
         let target = idx as i64;
-        let key = if target >= now { "ArrowRight" } else { "ArrowLeft" };
-        for _ in 0..(target - now).abs() {
-            ab_cmd(&self.ab, &["press", key], &self.session, remaining())
-                .context("moving the thinking-effort slider")?;
-            std::thread::sleep(Duration::from_millis(250));
+        let moved = ab_eval(
+            &self.ab,
+            &js_set_slider_index(target),
+            &self.session,
+            remaining(),
+        )
+        .context("moving the thinking-effort slider by pointer")?;
+        if !moved.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let detail = moved
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            bail!("could not move the thinking-effort slider: {detail}");
         }
-        std::thread::sleep(Duration::from_millis(300));
 
-        let after = ab_eval(&self.ab, JS_PICKER_MENU, &self.session, remaining())?;
-        let got = after
-            .get("slider")
-            .and_then(|v| v.get("now"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(-1);
-        if got != target {
-            bail!(
-                "could not move the thinking-effort slider to {} ({}): it sits at {}",
-                LEVEL_ORDER[idx],
-                target,
-                got
-            );
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(200));
+            let after = ab_eval(&self.ab, JS_PICKER_MENU, &self.session, remaining())?;
+            let got = after
+                .get("slider")
+                .and_then(|v| v.get("now"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
+            if got == target {
+                let shown = after.get("level").and_then(|v| v.as_str()).unwrap_or("");
+                eprintln!(
+                    "model: {} (slider {}{})",
+                    LEVEL_ORDER[idx],
+                    target,
+                    if shown.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", shown as {shown:?}")
+                    }
+                );
+                return Ok(());
+            }
         }
-        let shown = after.get("level").and_then(|v| v.as_str()).unwrap_or("");
-        eprintln!("model: {} (slider {}{})", LEVEL_ORDER[idx], target,
-            if shown.is_empty() { String::new() } else { format!(", shown as {shown:?}") });
-        Ok(())
+        bail!(
+            "could not move the thinking-effort slider to {} ({}): value did not settle",
+            LEVEL_ORDER[idx],
+            target
+        )
     }
 
     /// Pick a model family (`Latest`, `GPT-5.5`, …) from the menu's radio items.
@@ -2697,8 +3019,11 @@ impl SubmitFailure {
                     return e;
                 }
                 e.context(
-                    ChannelError::new(ErrorKind::SubmitUnknown, "the prompt may or may not have been sent")
-                        .with_submitted(Submitted::Unknown),
+                    ChannelError::new(
+                        ErrorKind::SubmitUnknown,
+                        "the prompt may or may not have been sent",
+                    )
+                    .with_submitted(Submitted::Unknown),
                 )
             }
         }
@@ -2843,7 +3168,9 @@ impl SurfaceLock {
         // Best-effort: a lock we hold but could not stamp is still a good lock.
         let _ = file
             .seek(std::io::SeekFrom::Start(0))
-            .and_then(|_| file.write_all(format!("chatgpt-use {}\n", std::process::id()).as_bytes()))
+            .and_then(|_| {
+                file.write_all(format!("chatgpt-use {}\n", std::process::id()).as_bytes())
+            })
             .and_then(|_| file.flush());
 
         Ok(SurfaceLock { _file: Some(file) })
@@ -2916,8 +3243,7 @@ fn composer_fingerprint(text: &str) -> (u64, u32) {
 /// Against a throttle that counts requests, that is worth caching. Purely an
 /// optimisation: any read or write failure just means we resolve the slow way.
 fn project_cache_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".chatgpt-use").join("projects.json"))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".chatgpt-use").join("projects.json"))
 }
 
 fn read_project_cache() -> serde_json::Map<String, serde_json::Value> {
@@ -2936,12 +3262,17 @@ fn cached_gizmo(name: &str) -> Option<String> {
 }
 
 fn remember_gizmo(name: &str, gizmo_id: &str) {
-    let Some(path) = project_cache_path() else { return };
+    let Some(path) = project_cache_path() else {
+        return;
+    };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let mut map = read_project_cache();
-    map.insert(name.to_string(), serde_json::Value::String(gizmo_id.to_string()));
+    map.insert(
+        name.to_string(),
+        serde_json::Value::String(gizmo_id.to_string()),
+    );
     if let Ok(text) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
         let _ = std::fs::write(path, text);
     }
@@ -2950,7 +3281,9 @@ fn remember_gizmo(name: &str, gizmo_id: &str) {
 /// Drop a remembered id after it turns out not to work — a deleted project, or
 /// one that belongs to a different account than the browser is now signed into.
 fn forget_gizmo(name: &str) {
-    let Some(path) = project_cache_path() else { return };
+    let Some(path) = project_cache_path() else {
+        return;
+    };
     let mut map = read_project_cache();
     if map.remove(name).is_some() {
         if let Ok(text) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
@@ -3105,12 +3438,7 @@ fn ab_cmd(ab: &PathBuf, args: &[&str], session: &str, timeout_secs: f64) -> Resu
 /// Convention (mirrors `_ab_eval`): the JS does `return JSON.stringify(value)`;
 /// chrome-use prints THAT string JSON-encoded, so we decode twice — once to get
 /// the inner JSON text, once to parse it into a value.
-fn ab_eval(
-    ab: &PathBuf,
-    js: &str,
-    session: &str,
-    timeout_secs: f64,
-) -> Result<serde_json::Value> {
+fn ab_eval(ab: &PathBuf, js: &str, session: &str, timeout_secs: f64) -> Result<serde_json::Value> {
     let raw = ab_cmd(ab, &["eval", js], session, timeout_secs)?;
 
     // Scan from the last non-empty line for the first that decodes to a string.
@@ -3183,7 +3511,10 @@ fn page_probe(ab: &PathBuf, session: &str) -> (bool, String) {
         Ok(v) => {
             let login = v.get("login").and_then(|b| b.as_bool()).unwrap_or(false);
             let field = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-            (login, format!("path {:?}, title {:?}", field("path"), field("title")))
+            (
+                login,
+                format!("path {:?}, title {:?}", field("path"), field("title")),
+            )
         }
         Err(e) => (false, format!("page unreadable: {e}")),
     }
@@ -3192,12 +3523,7 @@ fn page_probe(ab: &PathBuf, session: &str) -> (bool, String) {
 /// Poll until `#prompt-textarea` is on the page (mirrors `_wait_composer`).
 /// Returns `Ok(true)` when the composer is ready, `Ok(false)` on timeout.
 /// Bails with an error if the rate-limit dialog is detected.
-fn wait_composer(
-    ab: &PathBuf,
-    session: &str,
-    deadline: Instant,
-    tries: u32,
-) -> Result<bool> {
+fn wait_composer(ab: &PathBuf, session: &str, deadline: Instant, tries: u32) -> Result<bool> {
     for _ in 0..tries {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -3211,7 +3537,11 @@ fn wait_composer(
                 if st.get("limited").and_then(|v| v.as_bool()).unwrap_or(false) {
                     return Err(ChannelError::new(ErrorKind::RateLimited, RATE_LIMIT_MSG).into());
                 }
-                if st.get("composer").and_then(|v| v.as_bool()).unwrap_or(false) {
+                if st
+                    .get("composer")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
                     return Ok(true);
                 }
             }
@@ -3343,7 +3673,12 @@ mod tests {
 
     #[test]
     fn staged_byte_chunks_round_trip_long_unicode_prompt() {
-        let prompt = format!("{}\n{}\n{}", "A".repeat(7_777), "中文😀".repeat(900), "Z".repeat(6_321));
+        let prompt = format!(
+            "{}\n{}\n{}",
+            "A".repeat(7_777),
+            "中文😀".repeat(900),
+            "Z".repeat(6_321)
+        );
         let encoded: Vec<String> = prompt
             .as_bytes()
             .chunks(1_000)
@@ -3351,10 +3686,19 @@ mod tests {
             .collect();
         let mut bytes = Vec::new();
         for part in encoded {
-            bytes.extend(base64::engine::general_purpose::STANDARD.decode(part).unwrap());
+            bytes.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(part)
+                    .unwrap(),
+            );
         }
         assert_eq!(String::from_utf8(bytes).unwrap(), prompt);
-        assert_eq!(JS_COMMIT_COMPOSER_BUFFER.matches("execCommand('insertText'").count(), 1);
+        assert_eq!(
+            JS_COMMIT_COMPOSER_BUFFER
+                .matches("execCommand('insertText'")
+                .count(),
+            1
+        );
     }
 
     /// The reason the hash exists at all: chrome-use#301 scrambles chunked
@@ -3363,15 +3707,24 @@ mod tests {
     fn composer_fingerprint_detects_reordering_at_equal_length() {
         let (n1, h1) = composer_fingerprint("abcdef");
         let (n2, h2) = composer_fingerprint("abcdfe");
-        assert_eq!(n1, n2, "the failure mode under test keeps the count identical");
-        assert_ne!(h1, h2, "a reordered payload must not pass the integrity check");
+        assert_eq!(
+            n1, n2,
+            "the failure mode under test keeps the count identical"
+        );
+        assert_ne!(
+            h1, h2,
+            "a reordered payload must not pass the integrity check"
+        );
         assert_eq!((n1, h1), (6, 829399410));
         assert_eq!((n2, h2), (6, 793662762));
     }
 
     #[test]
     fn holder_label_reads_tool_and_pid() {
-        assert_eq!(holder_label("chatgpt-imagegen 4321\n"), "chatgpt-imagegen (pid 4321)");
+        assert_eq!(
+            holder_label("chatgpt-imagegen 4321\n"),
+            "chatgpt-imagegen (pid 4321)"
+        );
     }
 
     /// The case that caught the O_APPEND bug on the imagegen side: a PREVIOUS
@@ -3418,11 +3771,22 @@ mod tests {
     }
 
     #[test]
+    fn current_model_state_can_verify_family_without_opening_picker() {
+        assert!(model_family_matches_state("GPT-5.6 Sol", "gpt-5.6-sol-wm"));
+        assert!(!model_family_matches_state("GPT-5.5", "gpt-5.6-sol-wm"));
+        assert!(JS_CURRENT_MODEL_CONFIG.contains("last-started-model-config"));
+    }
+
+    #[test]
     fn picker_probe_is_structural_not_text_matched() {
-        // The whole point: never key off the button label, which drifts.
-        assert!(JS_FIND_PICKER.contains("composer-plus-btn"));
-        assert!(JS_FIND_PICKER.contains(r#"button[aria-haspopup="menu"]"#));
+        // Current ChatGPT exposes a stable intelligence trigger on the active
+        // composer form. Keep the probe structural and independent of localized
+        // labels or generated element ids.
+        assert!(JS_FIND_PICKER.contains("data-codex-intelligence-trigger"));
+        assert!(JS_FIND_PICKER.contains("closest('form')"));
         assert!(!JS_FIND_PICKER.to_lowercase().contains("instant"));
+        assert!(JS_OPEN_PICKER.contains("PointerEvent('pointerdown'"));
+        assert!(JS_PICKER_MENU.contains("composer-intelligence-picker-content") || JS_PICKER_MENU.contains("[role=\"menu\"]"));
         assert!(JS_PICKER_MENU.contains(r#"[role="slider"]"#));
         assert!(JS_PICKER_MENU.contains("aria-valuenow"));
     }
@@ -3450,13 +3814,34 @@ mod tests {
     fn js_probes_target_the_selectors_we_depend_on() {
         assert!(JS_CONVO_ID.contains(r"/\/c\/([0-9a-f-]{36})/i"));
         assert!(JS_USER_COUNT.contains(r#"[data-message-author-role="user"]"#));
+        assert!(JS_USER_COUNT.contains(r#"[data-content-search-unit-key$=":user"]"#));
+        assert!(JS_ASSISTANT_COUNT.contains(r#"[data-content-search-unit-key$=":assistant"]"#));
+        assert!(JS_STATE.contains(r#"[data-content-search-unit-key$=":user"]"#));
+        assert!(JS_STATE.contains(r#"[data-content-search-unit-key$=":assistant"]"#));
+        assert!(JS_LAST_ASSISTANT.contains(r#"[data-markdown-text-style="assistant-message"]"#));
+        for js in [JS_COMPOSER, JS_CLEAR_COMPOSER, JS_COMPOSER_FINGERPRINT, JS_COMMIT_COMPOSER_BUFFER] {
+            assert!(js.contains("#prompt-textarea"), "{js}");
+            assert!(js.contains(r#"div.ProseMirror[contenteditable="true"][role="textbox"]"#), "{js}");
+        }
+        assert!(COMPOSER_SELECTOR.contains("#prompt-textarea"));
+        assert!(COMPOSER_SELECTOR.contains(r#"div.ProseMirror[contenteditable="true"][role="textbox"]"#));
+        assert!(JS_FIND_PICKER.contains("data-codex-intelligence-trigger"));
+        assert!(JS_FIND_PICKER.contains("closest('form')"));
+        assert!(JS_OPEN_PICKER.contains("PointerEvent('pointerdown'"));
+        assert!(JS_SUBMIT_COMPOSER.contains("requestSubmit"));
     }
 
     #[test]
     fn js_ensure_project_embeds_name() {
         let js = js_ensure_project("my-project");
-        assert!(js.contains("my-project"), "JS should embed the project name");
-        assert!(js.contains("backend-api/projects"), "JS should reference the project API");
+        assert!(
+            js.contains("my-project"),
+            "JS should embed the project name"
+        );
+        assert!(
+            js.contains("backend-api/projects"),
+            "JS should reference the project API"
+        );
     }
 
     #[test]
@@ -3477,8 +3862,7 @@ mod tests {
         // Reproduce the decode loop from ab_eval.
         let inner: serde_json::Value = serde_json::from_str(&chrome_use_line).unwrap();
         assert!(inner.is_string());
-        let second: serde_json::Value =
-            serde_json::from_str(inner.as_str().unwrap()).unwrap();
+        let second: serde_json::Value = serde_json::from_str(inner.as_str().unwrap()).unwrap();
         assert_eq!(second["key"], "val");
     }
 
@@ -3495,27 +3879,44 @@ mod tests {
 
     #[test]
     fn channel_error_survives_context_layers() {
-        let e = typed(ErrorKind::RateLimited).context("resubmitting").context("outer");
-        assert_eq!(channel_error(&e).map(|c| c.kind), Some(ErrorKind::RateLimited));
+        let e = typed(ErrorKind::RateLimited)
+            .context("resubmitting")
+            .context("outer");
+        assert_eq!(
+            channel_error(&e).map(|c| c.kind),
+            Some(ErrorKind::RateLimited)
+        );
     }
 
     #[test]
     fn untyped_failures_are_typed_by_how_far_the_turn_got() {
         let before = classify(anyhow!("tab vanished"), false);
         let ce = channel_error(&before).unwrap();
-        assert_eq!((ce.kind, ce.submitted), (ErrorKind::NotSubmitted, Submitted::No));
-        assert!(format!("{before:#}").contains("tab vanished"), "the cause is kept");
+        assert_eq!(
+            (ce.kind, ce.submitted),
+            (ErrorKind::NotSubmitted, Submitted::No)
+        );
+        assert!(
+            format!("{before:#}").contains("tab vanished"),
+            "the cause is kept"
+        );
 
         let after = classify(anyhow!("page swapped"), true);
         let ce = channel_error(&after).unwrap();
-        assert_eq!((ce.kind, ce.submitted), (ErrorKind::Incomplete, Submitted::Yes));
+        assert_eq!(
+            (ce.kind, ce.submitted),
+            (ErrorKind::Incomplete, Submitted::Yes)
+        );
     }
 
     #[test]
     fn a_typed_failure_keeps_its_kind_and_takes_the_turn_phase() {
         let e = classify(typed(ErrorKind::RateLimited).context("while polling"), true);
         let ce = channel_error(&e).unwrap();
-        assert_eq!((ce.kind, ce.submitted), (ErrorKind::RateLimited, Submitted::Yes));
+        assert_eq!(
+            (ce.kind, ce.submitted),
+            (ErrorKind::RateLimited, Submitted::Yes)
+        );
     }
 
     #[test]
@@ -3530,15 +3931,27 @@ mod tests {
         let e = SubmitFailure::Ambiguous(typed(ErrorKind::RateLimited)).into_error();
         let e = classify(e, false);
         let ce = channel_error(&e).unwrap();
-        assert_eq!((ce.kind, ce.submitted), (ErrorKind::RateLimited, Submitted::Unknown));
+        assert_eq!(
+            (ce.kind, ce.submitted),
+            (ErrorKind::RateLimited, Submitted::Unknown)
+        );
     }
 
     #[test]
     fn no_failure_maps_to_completed() {
         use ErrorKind::*;
         for k in [
-            LoginRequired, RateLimited, SessionUnavailable, PageBlocked, NotSubmitted, SubmitUnknown,
-            Incomplete, Busy, Duplicate, Cancelled, CancelRequested,
+            LoginRequired,
+            RateLimited,
+            SessionUnavailable,
+            PageBlocked,
+            NotSubmitted,
+            SubmitUnknown,
+            Incomplete,
+            Busy,
+            Duplicate,
+            Cancelled,
+            CancelRequested,
         ] {
             assert_ne!(k.status(), "completed", "{k:?}");
         }
@@ -3558,10 +3971,18 @@ mod tests {
     #[test]
     fn a_stopped_turn_is_incomplete_not_a_reply() {
         // Exactly what the record showed after the stop button, live.
-        let e = judge_record(turn(true, "partial essay", Some("interrupted"), Some("client_stopped")))
-            .unwrap_err();
+        let e = judge_record(turn(
+            true,
+            "partial essay",
+            Some("interrupted"),
+            Some("client_stopped"),
+        ))
+        .unwrap_err();
         let ce = channel_error(&e).unwrap();
-        assert_eq!((ce.kind, ce.submitted), (ErrorKind::Incomplete, Submitted::Yes));
+        assert_eq!(
+            (ce.kind, ce.submitted),
+            (ErrorKind::Incomplete, Submitted::Yes)
+        );
         assert!(e.to_string().contains("client_stopped"), "{e}");
 
         let e = judge_record(turn(true, "", Some("max_tokens"), None)).unwrap_err();
@@ -3570,18 +3991,36 @@ mod tests {
 
     #[test]
     fn a_real_finish_is_a_reply_and_an_open_turn_is_not_yet() {
-        assert_eq!(judge_record(turn(true, "done", Some("stop"), None)).unwrap(), Some("done".into()));
+        assert_eq!(
+            judge_record(turn(true, "done", Some("stop"), None)).unwrap(),
+            Some("done".into())
+        );
         // An unknown finish type is not treated as a failure.
-        assert_eq!(judge_record(turn(true, "done", Some("new_kind"), None)).unwrap(), Some("done".into()));
-        assert_eq!(judge_record(turn(true, "done", None, None)).unwrap(), Some("done".into()));
-        assert_eq!(judge_record(turn(false, "streaming", None, None)).unwrap(), None);
-        assert_eq!(judge_record(turn(true, "  ", Some("stop"), None)).unwrap(), None);
+        assert_eq!(
+            judge_record(turn(true, "done", Some("new_kind"), None)).unwrap(),
+            Some("done".into())
+        );
+        assert_eq!(
+            judge_record(turn(true, "done", None, None)).unwrap(),
+            Some("done".into())
+        );
+        assert_eq!(
+            judge_record(turn(false, "streaming", None, None)).unwrap(),
+            None
+        );
+        assert_eq!(
+            judge_record(turn(true, "  ", Some("stop"), None)).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn the_record_walk_stops_at_this_turns_prompt() {
         let js = js_server_final("c-1");
-        assert!(js.contains("m.author.role === 'user') break"), "must not reach the previous turn");
+        assert!(
+            js.contains("m.author.role === 'user') break"),
+            "must not reach the previous turn"
+        );
         assert!(js.contains("finish_details"));
     }
 

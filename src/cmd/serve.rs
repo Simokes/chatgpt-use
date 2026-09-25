@@ -161,7 +161,9 @@ fn render_message_content(content: &MessageContent) -> String {
             .iter()
             .map(|block| match block {
                 ContentBlock::Text { text, .. } => text.clone(),
-                ContentBlock::ToolUse { name, input, id, .. } => {
+                ContentBlock::ToolUse {
+                    name, input, id, ..
+                } => {
                     // Render as readable text so ChatGPT understands it called a tool.
                     format!(
                         "[assistant called tool {} (id={})]\nInput: {}",
@@ -324,10 +326,7 @@ fn build_sse_body(msg_id: &str, model: &str, reply: &Reply) -> String {
 
     // Derive content array and stop_reason from the reply.
     let (content_items, stop_reason) = match reply {
-        Reply::Text(t) => (
-            vec![json!({"type": "text", "text": t})],
-            "end_turn",
-        ),
+        Reply::Text(t) => (vec![json!({"type": "text", "text": t})], "end_turn"),
         Reply::Tools(calls) => {
             let items: Vec<Value> = calls
                 .iter()
@@ -437,10 +436,7 @@ fn build_sse_body(msg_id: &str, model: &str, reply: &Reply) -> String {
     ));
 
     // 7. message_stop
-    out.push_str(&sse_frame(
-        "message_stop",
-        &json!({"type": "message_stop"}),
-    ));
+    out.push_str(&sse_frame("message_stop", &json!({"type": "message_stop"})));
 
     out
 }
@@ -496,10 +492,7 @@ fn models_response() -> Value {
 // Request handler
 // ---------------------------------------------------------------------------
 
-fn handle_request(
-    request: tiny_http::Request,
-    channel: &mut Channel,
-) -> Result<()> {
+fn handle_request(request: tiny_http::Request, channel: &mut Channel) -> Result<()> {
     let method = request.method().to_string();
     let url = request.url().to_string();
 
@@ -545,15 +538,14 @@ fn handle_request(
                             "message": format!("Failed to parse request body: {}", e)
                         }
                     });
-                    let response = tiny_http::Response::from_string(
-                        serde_json::to_string(&err_body)?,
-                    )
-                    .with_header(
-                        "Content-Type: application/json"
-                            .parse::<tiny_http::Header>()
-                            .unwrap(),
-                    )
-                    .with_status_code(400);
+                    let response =
+                        tiny_http::Response::from_string(serde_json::to_string(&err_body)?)
+                            .with_header(
+                                "Content-Type: application/json"
+                                    .parse::<tiny_http::Header>()
+                                    .unwrap(),
+                            )
+                            .with_status_code(400);
                     req.respond(response)?;
                     return Ok(());
                 }
@@ -564,7 +556,9 @@ fn handle_request(
 
             // Build the prompt and send it through the ChatGPT channel.
             let prompt = build_prompt(&req_body);
-            let reply_result = channel.send(&prompt).map(|text| protocol::parse_reply(&text));
+            let reply_result = channel
+                .send(&prompt)
+                .map(|text| protocol::parse_reply(&text));
 
             if stream {
                 // --- SSE streaming response ---
@@ -602,15 +596,13 @@ fn handle_request(
                         error_response(&msg_id, &model, &e)
                     }
                 };
-                let response = tiny_http::Response::from_string(
-                    serde_json::to_string(&json_body)?,
-                )
-                .with_header(
-                    "Content-Type: application/json"
-                        .parse::<tiny_http::Header>()
-                        .unwrap(),
-                )
-                .with_status_code(200);
+                let response = tiny_http::Response::from_string(serde_json::to_string(&json_body)?)
+                    .with_header(
+                        "Content-Type: application/json"
+                            .parse::<tiny_http::Header>()
+                            .unwrap(),
+                    )
+                    .with_status_code(200);
                 req.respond(response)?;
             }
         }
@@ -626,14 +618,13 @@ fn handle_request(
                     "message": format!("Unknown endpoint: {} {}", method, path)
                 }
             });
-            let response =
-                tiny_http::Response::from_string(serde_json::to_string(&err_body)?)
-                    .with_header(
-                        "Content-Type: application/json"
-                            .parse::<tiny_http::Header>()
-                            .unwrap(),
-                    )
-                    .with_status_code(404);
+            let response = tiny_http::Response::from_string(serde_json::to_string(&err_body)?)
+                .with_header(
+                    "Content-Type: application/json"
+                        .parse::<tiny_http::Header>()
+                        .unwrap(),
+                )
+                .with_status_code(404);
             request.respond(response)?;
         }
     }
@@ -651,7 +642,10 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to bind {}: {}", addr, e))?;
 
     eprintln!("[chatgpt-use serve] listening on http://{}", addr);
-    eprintln!("[chatgpt-use serve] set ANTHROPIC_BASE_URL=http://{} in Claude Code", addr);
+    eprintln!(
+        "[chatgpt-use serve] set ANTHROPIC_BASE_URL=http://{} in Claude Code",
+        addr
+    );
     eprintln!("[chatgpt-use serve] EXPERIMENTAL — concurrency 1, text tool-call protocol");
 
     // Connect one Channel up front and reuse it for all requests.

@@ -20,7 +20,10 @@ pub fn run(args: &CancelArgs) -> Result<()> {
     let mut envelope = cancel(args);
     envelope["request_id"] = args.request_id.as_str().into();
     let status = envelope["status"].as_str().unwrap_or("failed").to_string();
-    crate::ledger::record("cancel", json!({"request_id": args.request_id, "status": status}));
+    crate::ledger::record(
+        "cancel",
+        json!({"request_id": args.request_id, "status": status}),
+    );
     println!("{envelope}");
     let code = match status.as_str() {
         "cancelled" | "already_finished" => 0,
@@ -81,7 +84,9 @@ fn cancel(args: &CancelArgs) -> Value {
     let envelope = match result {
         Ok(_) => json!({"status": "already_finished", "outcome": "completed"}),
         Err(e) => match channel_error(&e).map(|c| c.kind) {
-            Some(ErrorKind::Cancelled) => json!({"status": "cancelled", "message": format!("{e:#}")}),
+            Some(ErrorKind::Cancelled) => {
+                json!({"status": "cancelled", "message": format!("{e:#}")})
+            }
             _ => structured::failure(&e),
         },
     };
@@ -89,9 +94,13 @@ fn cancel(args: &CancelArgs) -> Value {
     if envelope["status"] == "already_finished" {
         for_receipt = json!({"status": "completed"});
     } else if envelope["status"] == "cancelled" {
-        for_receipt = json!({"status": "cancelled", "error": {"message": "cancelled", "submitted": "yes"}});
+        for_receipt =
+            json!({"status": "cancelled", "error": {"message": "cancelled", "submitted": "yes"}});
     }
-    if matches!(for_receipt["status"].as_str(), Some("completed" | "cancelled")) {
+    if matches!(
+        for_receipt["status"].as_str(),
+        Some("completed" | "cancelled")
+    ) {
         receipt::finish(&path, &for_receipt);
     }
     let mut envelope = envelope;

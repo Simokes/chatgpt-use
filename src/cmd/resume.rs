@@ -17,7 +17,10 @@ pub fn run(args: &ResumeArgs) -> Result<()> {
     let mut envelope = resume(args);
     envelope["request_id"] = args.request_id.as_str().into();
     let status = envelope["status"].as_str().unwrap_or("failed").to_string();
-    crate::ledger::record("resume", json!({"request_id": args.request_id, "status": status}));
+    crate::ledger::record(
+        "resume",
+        json!({"request_id": args.request_id, "status": status}),
+    );
     println!("{envelope}");
     let code = structured::exit_code(&status);
     if code != 0 {
@@ -31,11 +34,21 @@ pub fn run(args: &ResumeArgs) -> Result<()> {
 fn resume(args: &ResumeArgs) -> Value {
     let id = &args.request_id;
     if !receipt::valid_id(id) {
-        return refusal("failed", "error", &format!("invalid request id {id:?}"), "no");
+        return refusal(
+            "failed",
+            "error",
+            &format!("invalid request id {id:?}"),
+            "no",
+        );
     }
     let path = receipt::path_for(id);
     let Some(r) = receipt::load(&path) else {
-        return refusal("failed", "unknown_request", &format!("no receipt for request {id:?}"), "no");
+        return refusal(
+            "failed",
+            "unknown_request",
+            &format!("no receipt for request {id:?}"),
+            "no",
+        );
     };
     let convo = match plan(&r, receipt::pid_alive) {
         Ok(convo) => convo,
@@ -90,7 +103,10 @@ fn plan(r: &Receipt, alive: impl Fn(u32) -> bool) -> Result<String, Value> {
         return Err(refusal(
             "busy",
             "busy",
-            &format!("request {id:?} is still running (pid {}); not attaching to it", r.pid),
+            &format!(
+                "request {id:?} is still running (pid {}); not attaching to it",
+                r.pid
+            ),
             &r.submitted,
         ));
     }
@@ -113,7 +129,11 @@ fn plan(r: &Receipt, alive: impl Fn(u32) -> bool) -> Result<String, Value> {
                 "request {id:?} has no recorded conversation (state {state}); there is nothing \
                  to attach to, and it will not be resent. Check the ChatGPT sidebar."
             ),
-            if r.submitted == "yes" { "yes" } else { "unknown" },
+            if r.submitted == "yes" {
+                "yes"
+            } else {
+                "unknown"
+            },
         )),
     }
 }
@@ -151,7 +171,11 @@ mod tests {
 
     #[test]
     fn a_request_without_a_conversation_is_submission_unknown_not_resent() {
-        for (state, submitted) in [("accepted", "no"), ("submitted", "yes"), ("failed", "unknown")] {
+        for (state, submitted) in [
+            ("accepted", "no"),
+            ("submitted", "yes"),
+            ("failed", "unknown"),
+        ] {
             let env = plan(&receipt(state, submitted, None), |_| false).unwrap_err();
             assert_eq!(env["status"], "submission_unknown", "{state}/{submitted}");
             assert_ne!(env["error"]["submitted"], "no", "{state}/{submitted}");

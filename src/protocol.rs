@@ -180,7 +180,9 @@ pub fn parse_reply(assistant_text: &str) -> Reply {
 /// tool-call envelope.
 fn find_envelope(text: &str) -> Option<ToolCallEnvelope> {
     for (start, _) in text.char_indices().filter(|(_, c)| *c == '{') {
-        let Some(end) = balanced_object_end(text, start) else { continue };
+        let Some(end) = balanced_object_end(text, start) else {
+            continue;
+        };
         let candidate = &text[start..end];
         // Cheap prefilter: skip objects that can't be an envelope.
         if !candidate.contains("tool_calls") {
@@ -249,9 +251,7 @@ pub fn render_results(results: &[ToolResult]) -> String {
         out.push_str("\n\n");
     }
 
-    out.push_str(
-        "Continue: call more tools as needed, or respond with plain text when done.",
-    );
+    out.push_str("Continue: call more tools as needed, or respond with plain text when done.");
     out
 }
 
@@ -423,7 +423,10 @@ I'll review it next."#;
         assert!(rendered.contains("call_1"), "should include first id");
         assert!(rendered.contains("call_2"), "should include second id");
         assert!(rendered.contains("fn main()"), "should include content");
-        assert!(rendered.contains("permission denied"), "should include error");
+        assert!(
+            rendered.contains("permission denied"),
+            "should include error"
+        );
         assert!(rendered.contains("ok"), "should label successful result");
         assert!(rendered.contains("error"), "should label failed result");
     }
@@ -441,7 +444,10 @@ I'll review it next."#;
         let tools: Vec<ToolSpec> = vec![];
         let prompt = system_prompt(&tools, "Add a --json flag to the status command.");
         assert!(prompt.contains("--json flag"), "should embed the task");
-        assert!(prompt.contains("tool_calls"), "should describe the tool-call format");
+        assert!(
+            prompt.contains("tool_calls"),
+            "should describe the tool-call format"
+        );
         assert!(
             prompt.contains("```json"),
             "should show the fenced block example"

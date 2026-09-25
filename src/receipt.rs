@@ -51,11 +51,15 @@ pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && !id.starts_with('.')
-        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
 pub fn path_for(id: &str) -> PathBuf {
-    crate::ledger::ledger_dir().join("requests").join(format!("{id}.json"))
+    crate::ledger::ledger_dir()
+        .join("requests")
+        .join(format!("{id}.json"))
 }
 
 pub fn load(path: &Path) -> Option<Receipt> {
@@ -80,7 +84,11 @@ pub fn create(path: &Path, receipt: &Receipt) -> std::io::Result<bool> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
         Ok(mut f) => {
             f.write_all(serde_json::to_string_pretty(receipt)?.as_bytes())?;
             f.sync_all()?;
@@ -95,7 +103,10 @@ pub fn create(path: &Path, receipt: &Receipt) -> std::io::Result<bool> {
 /// fail the turn it describes, so the failure is only reported.
 pub fn update(path: &Path, change: impl FnOnce(&mut Receipt)) {
     let Some(mut r) = load(path) else {
-        eprintln!("warning: receipt {} is missing; not updated", path.display());
+        eprintln!(
+            "warning: receipt {} is missing; not updated",
+            path.display()
+        );
         return;
     };
     change(&mut r);
@@ -110,11 +121,17 @@ pub fn update(path: &Path, change: impl FnOnce(&mut Receipt)) {
 /// otherwise the failure says how far it got.
 pub fn finish(path: &Path, envelope: &serde_json::Value) {
     let status = envelope["status"].as_str().unwrap_or("failed").to_string();
-    let replied = matches!(status.as_str(), "completed" | "schema_violation" | "unparseable");
+    let replied = matches!(
+        status.as_str(),
+        "completed" | "schema_violation" | "unparseable"
+    );
     let submitted = if replied {
         "yes".to_string()
     } else {
-        envelope["error"]["submitted"].as_str().unwrap_or("unknown").to_string()
+        envelope["error"]["submitted"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string()
     };
     let error = envelope["error"]["message"].as_str().map(str::to_string);
     let convo = envelope["conversation_id"].as_str().map(str::to_string);
@@ -222,7 +239,10 @@ mod tests {
         let r = Receipt::accepted("r");
         assert!(create(&path, &r).unwrap());
         assert_eq!(load(&path), Some(r.clone()));
-        assert!(!create(&path, &r).unwrap(), "a second claim on the same id must lose");
+        assert!(
+            !create(&path, &r).unwrap(),
+            "a second claim on the same id must lose"
+        );
         update(&path, |r| r.state = "submitted".into());
         assert_eq!(load(&path).unwrap().state, "submitted");
         let leftovers: Vec<_> = std::fs::read_dir(&dir)

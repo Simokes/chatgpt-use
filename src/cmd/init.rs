@@ -74,6 +74,8 @@ pub fn run(args: &InitArgs) -> Result<()> {
     println!("  3. In ChatGPT → Settings → Apps → Add custom connector, use the");
     println!("     public URL with the token, e.g.  https://<host>/?token={token}");
     println!("     (or header  Authorization: Bearer {token}), No-Auth mode.");
-    println!("  Note: read-only profile by default; pass --profile full for write/bash (trusted only).");
+    println!(
+        "  Note: read-only profile by default; pass --profile full for write/bash (trusted only)."
+    );
     Ok(())
 }

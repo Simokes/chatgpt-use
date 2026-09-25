@@ -25,21 +25,35 @@
 
 use crate::channel::{Channel, ChannelOptions, SendOptions};
 use crate::cli::WorkArgs;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::path::PathBuf;
 
 /// The sentinel ChatGPT must append so --loop can tell whether the task is done.
 const STATUS_LINE: &str =
     "End your reply with a line that is exactly `STATUS: DONE` if the task is fully \
      complete, or `STATUS: CONTINUE` if more tool steps remain.";
 
+fn sync_mcp_workspace_pointer() -> Result<()> {
+    let cwd = std::env::current_dir().context("reading work command cwd")?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")?;
+    let dir = home.join(".chatgpt-use");
+    std::fs::create_dir_all(&dir).context("creating chatgpt-use state dir")?;
+    let link = dir.join("current-worktree");
+    let tmp = dir.join(format!(".current-worktree.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(&cwd, &tmp).context("creating MCP workspace symlink")?;
+    std::fs::rename(&tmp, &link).context("activating MCP workspace symlink")?;
+    eprintln!("mcp workspace: {}", cwd.display());
+    Ok(())
+}
+
 pub fn run(args: &WorkArgs) -> Result<()> {
+    sync_mcp_workspace_pointer()?;
     // The connector requires a non-Pro model; default to Instant unless the
     // caller explicitly picked a level.
-    let model = args
-        .channel
-        .model
-        .clone()
-        .or_else(|| Some("instant".to_string()));
+    let model = args.channel.requested_model();
 
     // Building/testing can take minutes; give it plenty of room.
     let timeout_secs = args.channel.timeout.max(1200);
@@ -233,8 +247,18 @@ fn is_thin_report(reply: &str) -> bool {
     // 被拦截=blocked, 无法=cannot, 没有权限/受限=no permission/restricted,
     // 需要你/请提供=need you to/please provide, 我会继续尝试=I'll keep trying.
     const HEDGE_CJK: &[&str] = &[
-        "被拦截", "拦截了", "无法访问", "无法执行", "没有权限", "受限",
-        "需要你", "请提供", "请告诉我", "我会继续尝试", "未能执行", "无法完成",
+        "被拦截",
+        "拦截了",
+        "无法访问",
+        "无法执行",
+        "没有权限",
+        "受限",
+        "需要你",
+        "请提供",
+        "请告诉我",
+        "我会继续尝试",
+        "未能执行",
+        "无法完成",
     ];
     HEDGE.iter().any(|h| lower.contains(h)) || HEDGE_CJK.iter().any(|h| r.contains(h))
 }
@@ -243,7 +267,9 @@ fn is_thin_report(reply: &str) -> bool {
 /// the regex crate at this layer.
 fn regex_like_git_hash(s: &str) -> bool {
     s.split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| {
-        tok.len() >= 7 && tok.len() <= 40 && tok.chars().all(|c| c.is_ascii_hexdigit())
+        tok.len() >= 7
+            && tok.len() <= 40
+            && tok.chars().all(|c| c.is_ascii_hexdigit())
             && tok.chars().any(|c| c.is_ascii_digit())
             && tok.chars().any(|c| c.is_ascii_alphabetic())
     })
@@ -268,7 +294,9 @@ mod tests {
 
     #[test]
     fn thin_report_flags_hedging() {
-        assert!(is_thin_report("Sure, I can do that. Could you provide the file path?"));
+        assert!(is_thin_report(
+            "Sure, I can do that. Could you provide the file path?"
+        ));
         assert!(is_thin_report("ok")); // too short
         assert!(is_thin_report(
             "I would start by reading the README, then I'd run the tests. Let me know if that works."
@@ -280,7 +308,10 @@ mod tests {
         // A LONG (>8 line) refusal must still count as thin — length is not evidence.
         let long_refusal = "我无法执行你所描述的工具链。\n\n因此我不能真实运行:\n\nuname -a\nsw_vers\nwhoami\ndate\n\n也不能伪造原始输出。\n\n需要由控制器把工具结果返回。";
         assert!(long_refusal.lines().count() >= 8);
-        assert!(is_thin_report(long_refusal), "long CJK refusal should be thin");
+        assert!(
+            is_thin_report(long_refusal),
+            "long CJK refusal should be thin"
+        );
     }
 
     #[test]
@@ -292,7 +323,10 @@ mod tests {
             "git_status returned:\n modified: src/channel.rs\n modified: src/cli.rs"
         ));
         // A long structured report without hedging is substantive.
-        let long = (0..10).map(|i| format!("step {i}: did a thing")).collect::<Vec<_>>().join("\n");
+        let long = (0..10)
+            .map(|i| format!("step {i}: did a thing"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(!is_thin_report(&long));
     }
 

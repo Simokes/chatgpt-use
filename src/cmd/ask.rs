@@ -13,14 +13,14 @@
 //! Owned by the MODES-1-2 agent.
 
 use crate::channel::{Channel, ChannelOptions};
+use crate::channel::{ChannelError, ErrorKind, Submitted};
 use crate::cli::AskArgs;
 use crate::delegation::{self, Mode};
-use crate::structured;
-use crate::channel::{ChannelError, ErrorKind, Submitted};
 use crate::receipt;
-use std::path::PathBuf;
+use crate::structured;
 use anyhow::{Context, Result};
 use std::fs;
+use std::path::PathBuf;
 
 pub fn run(args: &AskArgs) -> Result<()> {
     let opts = channel_opts_from_args(args);
@@ -32,7 +32,10 @@ pub fn run(args: &AskArgs) -> Result<()> {
 
     if let Some(schema) = &args.output_schema {
         if args.mode != Mode::Ask {
-            anyhow::bail!("--output-schema works with plain ask only, not --mode {:?}", args.mode);
+            anyhow::bail!(
+                "--output-schema works with plain ask only, not --mode {:?}",
+                args.mode
+            );
         }
         run_schema_mode(args, opts, schema)
     } else if args.mode == Mode::Ask {
@@ -62,7 +65,8 @@ fn ask_message(args: &AskArgs) -> Result<String> {
 
 fn attach_requested_files(channel: &Channel, args: &AskArgs) -> Result<()> {
     for file in &args.attach_files {
-        channel.attach_file(file)
+        channel
+            .attach_file(file)
             .with_context(|| format!("failed to attach browser file: {file}"))?;
     }
     Ok(())
@@ -129,20 +133,19 @@ fn run_schema_mode(args: &AskArgs, mut opts: ChannelOptions, schema_path: &str) 
     let mut envelope = match claimed {
         Err(envelope) => envelope,
         Ok((schema, request)) => {
-            {
-                let message = structured::build_message(&request, &schema);
-                match connect_for_ask(args, &opts) {
-                    Err(e) => structured::failure(&e),
-                    Ok(mut channel) => {
-                        let reply = attach_requested_files(&channel, args).and_then(|_| channel.send(&message));
-                        let convo = channel.conversation_id().map(str::to_string);
-                        channel.close();
-                        let mut envelope = structured::evaluate(reply, &schema);
-                        if let Some(id) = convo {
-                            envelope["conversation_id"] = id.into();
-                        }
-                        envelope
+            let message = structured::build_message(&request, &schema);
+            match connect_for_ask(args, &opts) {
+                Err(e) => structured::failure(&e),
+                Ok(mut channel) => {
+                    let reply =
+                        attach_requested_files(&channel, args).and_then(|_| channel.send(&message));
+                    let convo = channel.conversation_id().map(str::to_string);
+                    channel.close();
+                    let mut envelope = structured::evaluate(reply, &schema);
+                    if let Some(id) = convo {
+                        envelope["conversation_id"] = id.into();
                     }
+                    envelope
                 }
             }
         }
@@ -177,9 +180,13 @@ fn run_schema_mode(args: &AskArgs, mut opts: ChannelOptions, schema_path: &str) 
 /// id whose earlier request may have reached ChatGPT: the caller asked for a
 /// receipt precisely so that a lost reply is looked up, not sent twice.
 fn claim_receipt(args: &AskArgs) -> Result<Option<PathBuf>> {
-    let Some(id) = &args.request_id else { return Ok(None) };
+    let Some(id) = &args.request_id else {
+        return Ok(None);
+    };
     if !receipt::valid_id(id) {
-        anyhow::bail!("invalid --request-id {id:?}: use letters, digits, '.', '_' or '-' (up to 128)");
+        anyhow::bail!(
+            "invalid --request-id {id:?}: use letters, digits, '.', '_' or '-' (up to 128)"
+        );
     }
     let path = receipt::path_for(id);
     let fresh = receipt::Receipt::accepted(id);
@@ -198,7 +205,11 @@ fn claim_receipt(args: &AskArgs) -> Result<Option<PathBuf>> {
             .unwrap_or(("unreadable", "unknown"));
         // `submitted` describes the EARLIER request — the one a caller must
         // not resend — not this refused call, which sent nothing.
-        let prior = if submitted == "yes" { Submitted::Yes } else { Submitted::Unknown };
+        let prior = if submitted == "yes" {
+            Submitted::Yes
+        } else {
+            Submitted::Unknown
+        };
         return Err(ChannelError::new(
             ErrorKind::Duplicate,
             format!(
@@ -229,9 +240,7 @@ fn run_delegation_mode(args: &AskArgs, opts: ChannelOptions) -> Result<()> {
     for file_path in &args.files {
         let contents = fs::read_to_string(file_path)
             .with_context(|| format!("failed to read context file: {file_path}"))?;
-        context.push_str(&format!(
-            "### File: {file_path}\n```\n{contents}\n```\n\n"
-        ));
+        context.push_str(&format!("### File: {file_path}\n```\n{contents}\n```\n\n"));
     }
 
     // Build the mode-typed delegation-packet prompt.
@@ -325,7 +334,11 @@ fn channel_opts_from_args(args: &AskArgs) -> ChannelOptions {
     ChannelOptions {
         profile: args.channel.profile.clone(),
         session: args.channel.session.clone(),
-        project: if args.channel.temporary { String::new() } else { args.channel.project.clone() },
+        project: if args.channel.temporary {
+            String::new()
+        } else {
+            args.channel.project.clone()
+        },
         temporary: args.channel.temporary,
         timeout_secs: args.channel.timeout,
         model: args.channel.requested_model(),

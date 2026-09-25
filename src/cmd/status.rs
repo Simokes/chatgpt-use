@@ -16,7 +16,11 @@ pub fn run(args: &StatusArgs) -> Result<()> {
     let state = receipt::live_state(&r, receipt::pid_alive);
     // The receipt's "no" only meant "not recorded yet" while the owner ran; an
     // owner that died before recording anything may still have pressed Enter.
-    let submitted = if state == "submission_unknown" { "unknown" } else { r.submitted.as_str() };
+    let submitted = if state == "submission_unknown" {
+        "unknown"
+    } else {
+        r.submitted.as_str()
+    };
     println!(
         "{}",
         serde_json::json!({

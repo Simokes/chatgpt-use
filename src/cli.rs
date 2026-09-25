@@ -88,7 +88,11 @@ pub struct WorkArgs {
     pub task: String,
     /// Append this work turn to an existing ChatGPT conversation instead of creating
     /// a new chat. The conversation is reopened and identity-checked before typing.
-    #[arg(long = "conversation-id", value_name = "ID", conflicts_with = "temporary")]
+    #[arg(
+        long = "conversation-id",
+        value_name = "ID",
+        conflicts_with = "temporary"
+    )]
     pub conversation_id: Option<String>,
     /// If ChatGPT replies without evidence it actually ran the tools (a thin or
     /// hedging report), re-nudge it this many extra times in the same conversation.
@@ -217,7 +221,11 @@ pub struct AskArgs {
     pub request_id: Option<String>,
     /// Append this turn to an existing ChatGPT conversation instead of creating
     /// a new chat. The conversation is reopened and identity-checked before typing.
-    #[arg(long = "conversation-id", value_name = "ID", conflicts_with = "temporary")]
+    #[arg(
+        long = "conversation-id",
+        value_name = "ID",
+        conflicts_with = "temporary"
+    )]
     pub conversation_id: Option<String>,
     #[command(flatten)]
     pub channel: ChannelArgs,
@@ -284,7 +292,7 @@ pub struct McpArgs {
     pub auth_mode: AuthMode,
     /// Per-command timeout (seconds) for the persistent `bash` terminal under
     /// --profile full; 0 = unlimited. Bounds a hung command so it can't freeze
-    /// the single-threaded server. The shell keeps cwd + exported env across calls.
+    /// an individual tool worker. The shell keeps cwd + exported env across calls.
     #[arg(long, default_value_t = 300)]
     pub bash_timeout: u64,
     /// Directory to expose to the `list_skills`/`read_skill` tools (lets ChatGPT

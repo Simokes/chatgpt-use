@@ -38,9 +38,8 @@ fn read_packet_source(packet: &str) -> Result<String> {
 
 /// Parse JSON into a `DelegationPacket`, giving a clear error on failure.
 fn parse_packet(raw: &str) -> Result<DelegationPacket> {
-    serde_json::from_str(raw).context(
-        "delegation packet is not valid JSON or does not match DelegationPacket schema",
-    )
+    serde_json::from_str(raw)
+        .context("delegation packet is not valid JSON or does not match DelegationPacket schema")
 }
 
 /// Gate on `verdict`: only `Proceed` passes; `Revise` / `Blocked` return `Err`.
@@ -146,7 +145,11 @@ pub(crate) fn render_instruction(packet: &DelegationPacket) -> String {
 
 /// Build the `std::process::Command` for the chosen executor, ready to spawn.
 /// The instruction is passed as a single argument (no shell interpolation).
-fn build_command(executor: Executor, instruction: &str, cwd: &std::path::Path) -> std::process::Command {
+fn build_command(
+    executor: Executor,
+    instruction: &str,
+    cwd: &std::path::Path,
+) -> std::process::Command {
     let (program, subcommand) = match executor {
         Executor::Codex => ("codex", Some("exec")),
         Executor::ClaudeCode => ("claude", None),
@@ -274,7 +277,10 @@ mod tests {
             ],
             risks: vec!["Sandbox blocks git writes".to_owned()],
             tests: vec!["cargo test 2>&1 | tail -40".to_owned()],
-            acceptance: vec!["All tests pass".to_owned(), "No compiler warnings".to_owned()],
+            acceptance: vec![
+                "All tests pass".to_owned(),
+                "No compiler warnings".to_owned(),
+            ],
             do_not_do: vec![
                 "Do not edit Cargo.toml".to_owned(),
                 "Do not commit or push".to_owned(),
@@ -302,17 +308,17 @@ mod tests {
             rendered.contains("1. Create handoff.rs → src/cmd/handoff.rs"),
             "missing step 1"
         );
-        assert!(
-            rendered.contains("2. Add unit tests"),
-            "missing step 2"
-        );
+        assert!(rendered.contains("2. Add unit tests"), "missing step 2");
 
         // Acceptance criteria
         assert!(
             rendered.contains("ACCEPTANCE CRITERIA"),
             "missing ACCEPTANCE section"
         );
-        assert!(rendered.contains("All tests pass"), "missing acceptance item");
+        assert!(
+            rendered.contains("All tests pass"),
+            "missing acceptance item"
+        );
 
         // Do-not-do list
         assert!(rendered.contains("DO NOT:"), "missing DO NOT section");
@@ -333,7 +339,10 @@ mod tests {
         let result = check_verdict(&packet);
         assert!(result.is_err(), "Blocked verdict should return Err");
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("BLOCKED"), "error message should mention BLOCKED");
+        assert!(
+            msg.contains("BLOCKED"),
+            "error message should mention BLOCKED"
+        );
     }
 
     /// Verdict::Revise must return Err with the right message.
@@ -343,7 +352,10 @@ mod tests {
         let result = check_verdict(&packet);
         assert!(result.is_err(), "Revise verdict should return Err");
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("REVISE"), "error message should mention REVISE");
+        assert!(
+            msg.contains("REVISE"),
+            "error message should mention REVISE"
+        );
         assert!(
             msg.contains("Sandbox blocks git writes"),
             "error should surface the risks"
@@ -371,9 +383,18 @@ mod tests {
             verdict: Verdict::Proceed,
         };
         let rendered = render_instruction(&packet);
-        assert!(rendered.contains("Minimal goal."), "goal should always appear");
+        assert!(
+            rendered.contains("Minimal goal."),
+            "goal should always appear"
+        );
         // Absent sections should not appear as empty noise
-        assert!(!rendered.contains("PLAN\n\n"), "empty plan should be omitted");
-        assert!(!rendered.contains("DO NOT:"), "empty do_not_do should be omitted");
+        assert!(
+            !rendered.contains("PLAN\n\n"),
+            "empty plan should be omitted"
+        );
+        assert!(
+            !rendered.contains("DO NOT:"),
+            "empty do_not_do should be omitted"
+        );
     }
 }

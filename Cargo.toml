@@ -33,3 +33,6 @@ signal-hook = { version = "0.4", default-features = false }
 [profile.release]
 strip = true
 lto = "thin"
+
+[patch.crates-io]
+tiny_http = { path = "vendor/tiny_http" }

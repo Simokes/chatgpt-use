@@ -19,7 +19,7 @@ use walkdir::WalkDir;
 /// Persistent-shell config. When set (by the MCP server at startup), `bash`
 /// behaves like a real terminal: the working directory and exported environment
 /// carry over between calls, and each command is bounded by a timeout so a hung
-/// command can't freeze the single-threaded server. When unset (unit tests,
+/// command is bounded even if the filesystem or child process stalls. When unset (unit tests,
 /// Mode-2 `run`), `bash` keeps its original stateless one-shot behavior.
 #[derive(Debug, Clone)]
 pub struct ShellConfig {
@@ -38,7 +38,11 @@ pub fn configure_shell(state_dir: PathBuf, timeout_secs: u64) {
     // Fresh session: drop carried-over cwd/env from a previous server run.
     let _ = std::fs::remove_file(state_dir.join("cwd"));
     let _ = std::fs::remove_file(state_dir.join("env"));
-    let _ = SHELL_CFG.set(ShellConfig { state_dir, timeout_secs });
+    let _ = std::fs::remove_file(state_dir.join("root"));
+    let _ = SHELL_CFG.set(ShellConfig {
+        state_dir,
+        timeout_secs,
+    });
 }
 
 /// Root directory for skill discovery (`list_skills`/`read_skill`). Each skill is
@@ -58,8 +62,7 @@ fn skills_dir() -> Option<PathBuf> {
     match SKILLS_DIR.get() {
         Some(p) if p.as_os_str().is_empty() => None, // explicitly disabled
         Some(p) => Some(p.clone()),
-        None => std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join(".claude").join("skills")),
+        None => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude").join("skills")),
     }
 }
 
@@ -110,8 +113,8 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_dir".to_string(),
-            description: "List files and directories under a path, recursively. \
-                          Returns one entry per line."
+            description: "List the immediate files and directories under a path. \
+                          Call list_dir on a subdirectory to inspect deeper levels."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -251,7 +254,12 @@ pub fn builtin_specs() -> Vec<ToolSpec> {
 /// prompt on stderr/stdin for y/N before running; read-only tools never prompt.
 /// Paths are resolved under `cwd`; errors are returned as `ok: false` results
 /// rather than panicking.
-pub fn execute(call: &ToolCall, cwd: &Path, auto_approve: bool, perm: PermissionMode) -> ToolResult {
+pub fn execute(
+    call: &ToolCall,
+    cwd: &Path,
+    auto_approve: bool,
+    perm: PermissionMode,
+) -> ToolResult {
     let result = match call.name.as_str() {
         "read_file" => tool_read_file(&call.input, cwd),
         "write_file" => tool_write_file(&call.input, cwd, auto_approve),
@@ -288,8 +296,7 @@ pub fn execute(call: &ToolCall, cwd: &Path, auto_approve: bool, perm: Permission
 fn tool_read_file(input: &Value, cwd: &Path) -> Result<String, String> {
     let path_str = require_string(input, "path")?;
     let path = resolve_path(cwd, &path_str)?;
-    std::fs::read_to_string(&path)
-        .map_err(|e| format!("read_file: {}: {e}", path.display()))
+    std::fs::read_to_string(&path).map_err(|e| format!("read_file: {}: {e}", path.display()))
 }
 
 fn tool_write_file(input: &Value, cwd: &Path, auto_approve: bool) -> Result<String, String> {
@@ -314,114 +321,172 @@ fn tool_write_file(input: &Value, cwd: &Path, auto_approve: bool) -> Result<Stri
             .map_err(|e| format!("write_file: creating parent dirs: {e}"))?;
     }
 
-    std::fs::write(&path, content)
-        .map_err(|e| format!("write_file: {}: {e}", path.display()))?;
+    std::fs::write(&path, content).map_err(|e| format!("write_file: {}: {e}", path.display()))?;
 
     Ok(format!("written: {}", path.display()))
 }
 
 fn tool_list_dir(input: &Value, cwd: &Path) -> Result<String, String> {
-    let path_str = input
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or(".");
+    const MAX_ENTRIES: usize = 512;
+    const MAX_BYTES: usize = 64 * 1024;
+    const NOTICE: &str = "\n…(listing truncated; call list_dir on a subdirectory)";
+    let path_str = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
     let path = resolve_path(cwd, path_str)?;
-
     if !path.is_dir() {
         return Err(format!("list_dir: not a directory: {}", path.display()));
     }
-
-    let mut lines: Vec<String> = Vec::new();
-    for entry in WalkDir::new(&path)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        // Show relative path from the listed root.
-        let rel = entry.path().strip_prefix(&path).unwrap_or(entry.path());
-        let display = rel.display().to_string();
-        if display.is_empty() || display == "." {
-            continue;
+    let entries =
+        std::fs::read_dir(&path).map_err(|e| format!("list_dir: {}: {e}", path.display()))?;
+    let mut lines = Vec::new();
+    let mut bytes = 0usize;
+    let mut limited = false;
+    for item in entries {
+        let item = item.map_err(|e| format!("list_dir: {}: {e}", path.display()))?;
+        let ty = item
+            .file_type()
+            .map_err(|e| format!("list_dir: {}: {e}", item.path().display()))?;
+        let suffix = if ty.is_dir() { "/" } else { "" };
+        let row = format!("{}{suffix}", item.file_name().to_string_lossy());
+        if lines.len() >= MAX_ENTRIES || bytes + row.len() + 1 > MAX_BYTES - NOTICE.len() {
+            limited = true;
+            break;
         }
-        if entry.path().is_dir() {
-            lines.push(format!("{}/", display));
-        } else {
-            lines.push(display);
-        }
+        bytes += row.len() + 1;
+        lines.push(row);
     }
-
+    lines.sort();
     if lines.is_empty() {
         return Ok("(empty directory)".to_string());
     }
-
-    lines.sort();
-    Ok(lines.join("\n"))
+    let mut output = lines.join("\n");
+    if limited {
+        output.push_str(NOTICE);
+    }
+    Ok(output)
 }
 
 fn tool_grep(input: &Value, cwd: &Path) -> Result<String, String> {
+    const MAX_FILES: usize = 2_000;
+    const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+    const MAX_MATCHES: usize = 500;
+    const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+    const NOTICE: &str = "…(search truncated; narrow the path or pattern)";
+    const SKIP_DIRS: &[&str] = &[
+        ".git",
+        "node_modules",
+        "target",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".next",
+        "dist",
+        "build",
+    ];
+
     let pattern_str = require_string(input, "pattern")?;
     let re = Regex::new(&pattern_str)
         .map_err(|e| format!("grep: invalid regex {:?}: {e}", pattern_str))?;
-
-    let search_path_str = input
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or(".");
+    let search_path_str = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
     let search_path = resolve_path(cwd, search_path_str)?;
 
-    let mut matches: Vec<String> = Vec::new();
-
-    // Walk files under search_path (or read a single file directly).
-    let entries: Box<dyn Iterator<Item = PathBuf>> = if search_path.is_file() {
-        Box::new(std::iter::once(search_path.clone()))
+    let mut files = Vec::new();
+    let mut limited = false;
+    if search_path.is_file() {
+        files.push(search_path.clone());
     } else {
-        Box::new(
-            WalkDir::new(&search_path)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_file())
-                .map(|e| e.path().to_path_buf()),
-        )
-    };
+        let walker = WalkDir::new(&search_path)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                !e.file_type().is_dir()
+                    || !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref())
+            });
+        for entry in walker {
+            let entry =
+                entry.map_err(|e| format!("grep: walking {}: {e}", search_path.display()))?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if files.len() >= MAX_FILES {
+                limited = true;
+                break;
+            }
+            files.push(entry.path().to_path_buf());
+        }
+    }
 
-    for file_path in entries {
-        // Skip binary-looking files (no extension or non-UTF-8).
+    let mut matches = Vec::new();
+    let mut output_bytes = 0usize;
+
+    'files: for file_path in files {
+        let metadata = match std::fs::metadata(&file_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if metadata.len() > MAX_FILE_BYTES {
+            limited = true;
+            continue;
+        }
         let content = match std::fs::read(&file_path) {
             Ok(b) => b,
             Err(_) => continue,
         };
         let text = match std::str::from_utf8(&content) {
             Ok(s) => s,
-            Err(_) => continue, // skip binary files
+            Err(_) => continue,
         };
-
         let rel = file_path
             .strip_prefix(cwd)
             .unwrap_or(&file_path)
             .display()
             .to_string();
-
         for (line_no, line) in text.lines().enumerate() {
-            if re.is_match(line) {
-                matches.push(format!("{}:{}: {}", rel, line_no + 1, line));
+            if !re.is_match(line) {
+                continue;
             }
+            let row = format!("{}:{}: {}", rel, line_no + 1, line);
+            if matches.len() >= MAX_MATCHES || output_bytes + row.len() + 1 > MAX_OUTPUT_BYTES {
+                limited = true;
+                break 'files;
+            }
+            output_bytes += row.len() + 1;
+            matches.push(row);
         }
     }
 
     if matches.is_empty() {
-        return Ok(format!("(no matches for {:?})", pattern_str));
+        let mut output = format!("(no matches for {:?})", pattern_str);
+        if limited {
+            output.push('\n');
+            output.push_str(NOTICE);
+        }
+        return Ok(output);
     }
-
-    Ok(matches.join("\n"))
+    let mut output = matches.join("\n");
+    if limited {
+        output.push('\n');
+        output.push_str(NOTICE);
+    }
+    Ok(output)
 }
 
 /// Catastrophic, irreversible patterns blocked even in `trusted` mode.
 fn destructive_reason(cmd: &str) -> Option<String> {
     let c = cmd.to_lowercase();
     let pats = [
-        "rm -rf /", "rm -rf /*", "rm -rf ~", "rm -fr /", "rm -rf --no-preserve-root",
-        "mkfs", "dd if=", ":(){", "> /dev/sd", "of=/dev/", "chmod -r 777 /", "chown -r",
+        "rm -rf /",
+        "rm -rf /*",
+        "rm -rf ~",
+        "rm -fr /",
+        "rm -rf --no-preserve-root",
+        "mkfs",
+        "dd if=",
+        ":(){",
+        "> /dev/sd",
+        "of=/dev/",
+        "chmod -r 777 /",
+        "chown -r",
     ];
     pats.iter()
         .find(|p| c.contains(**p))
@@ -430,12 +495,19 @@ fn destructive_reason(cmd: &str) -> Option<String> {
 
 /// Network-reaching commands, blocked in `safe` mode.
 fn network_reason(cmd: &str) -> Option<String> {
-    let tools = ["curl", "wget", "nc ", "ncat", "netcat", "ssh ", "scp ", "sftp", "telnet", "ftp "];
+    let tools = [
+        "curl", "wget", "nc ", "ncat", "netcat", "ssh ", "scp ", "sftp", "telnet", "ftp ",
+    ];
     // crude word-ish check on the command head + after pipes/&&/;
-    let segments: Vec<&str> = cmd.split(|ch| ch == '|' || ch == ';' || ch == '&').collect();
+    let segments: Vec<&str> = cmd
+        .split(|ch| ch == '|' || ch == ';' || ch == '&')
+        .collect();
     for seg in segments {
         let head = seg.trim_start();
-        if let Some(t) = tools.iter().find(|t| head.starts_with(t.trim()) && (head.len() == t.trim().len() || head[t.trim().len()..].starts_with(' '))) {
+        if let Some(t) = tools.iter().find(|t| {
+            head.starts_with(t.trim())
+                && (head.len() == t.trim().len() || head[t.trim().len()..].starts_with(' '))
+        }) {
             return Some(format!("network command {:?}", t.trim()));
         }
     }
@@ -462,13 +534,31 @@ fn gate_command(command: &str, perm: PermissionMode) -> Option<String> {
 /// Env var names that look secret — filtered out (except in `dangerous` mode).
 fn is_secret_env(name: &str) -> bool {
     let n = name.to_uppercase();
-    ["SECRET", "TOKEN", "PASSWORD", "PASSWD", "APIKEY", "API_KEY", "CREDENTIAL",
-     "PRIVATE_KEY", "ACCESS_KEY", "SESSION", "OPENAI", "ANTHROPIC", "AWS_"]
-        .iter()
-        .any(|p| n.contains(p))
+    [
+        "SECRET",
+        "TOKEN",
+        "PASSWORD",
+        "PASSWD",
+        "APIKEY",
+        "API_KEY",
+        "CREDENTIAL",
+        "PRIVATE_KEY",
+        "ACCESS_KEY",
+        "SESSION",
+        "OPENAI",
+        "ANTHROPIC",
+        "AWS_",
+    ]
+    .iter()
+    .any(|p| n.contains(p))
 }
 
-fn tool_bash(input: &Value, cwd: &Path, auto_approve: bool, perm: PermissionMode) -> Result<String, String> {
+fn tool_bash(
+    input: &Value,
+    cwd: &Path,
+    auto_approve: bool,
+    perm: PermissionMode,
+) -> Result<String, String> {
     let command = require_string(input, "command")?;
 
     if let Some(reason) = gate_command(&command, perm) {
@@ -531,14 +621,20 @@ fn format_output(stdout: &str, stderr: &str, exit_code: i32, note: Option<&str>)
 /// Original stateless behavior: one fresh `sh -c` at `cwd`, no timeout.
 fn run_oneshot(command: &str, cwd: &Path, perm: PermissionMode) -> Result<String, String> {
     let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command).current_dir(cwd);
+    let script = format!("{}{}", shell_platform_prelude(cwd), command);
+    cmd.arg("-c").arg(&script).current_dir(cwd);
     apply_env_filter(&mut cmd, perm);
     let output = cmd
         .output()
         .map_err(|e| format!("bash: failed to spawn shell: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    Ok(format_output(&stdout, &stderr, output.status.code().unwrap_or(-1), None))
+    Ok(format_output(
+        &stdout,
+        &stderr,
+        output.status.code().unwrap_or(-1),
+        None,
+    ))
 }
 
 /// Persistent-terminal behavior: the working directory and exported env carry
@@ -555,8 +651,23 @@ fn run_persistent(
     std::fs::create_dir_all(dir).map_err(|e| format!("bash: cannot create state dir: {e}"))?;
     let cwd_file = dir.join("cwd");
     let env_file = dir.join("env");
+    let root_file = dir.join("root");
     let out_file = dir.join("out");
     let err_file = dir.join("err");
+
+    let current_root = default_cwd
+        .canonicalize()
+        .map_err(|e| format!("bash: cannot resolve workspace root: {e}"))?;
+    let root_changed = std::fs::read_to_string(&root_file)
+        .ok()
+        .map(|saved| PathBuf::from(saved.trim()) != current_root)
+        .unwrap_or(true);
+    if root_changed {
+        let _ = std::fs::remove_file(&cwd_file);
+        let _ = std::fs::remove_file(&env_file);
+        std::fs::write(&root_file, current_root.to_string_lossy().as_bytes())
+            .map_err(|e| format!("bash: cannot persist workspace root: {e}"))?;
+    }
     // Best-effort clean of prior scratch so we never report stale output.
     let _ = std::fs::remove_file(&out_file);
     let _ = std::fs::remove_file(&err_file);
@@ -570,6 +681,7 @@ fn run_persistent(
         "__d=\"$(cat '{cwd}' 2>/dev/null)\"\n\
          if [ -d \"$__d\" ]; then cd \"$__d\"; else cd '{def}'; fi\n\
          [ -f '{env}' ] && . '{env}' 2>/dev/null\n\
+         {prelude}\
          {{\n{cmd}\n}} > '{out}' 2> '{err}'\n\
          __rc=$?\n\
          pwd > '{cwd}' 2>/dev/null\n\
@@ -580,6 +692,7 @@ fn run_persistent(
         out = q(&out_file),
         err = q(&err_file),
         def = q(default_cwd),
+        prelude = shell_platform_prelude(default_cwd),
         cmd = command,
     );
 
@@ -658,7 +771,11 @@ fn parse_skill_frontmatter(md: &str, fallback_name: &str) -> (String, String) {
 fn tool_list_skills() -> Result<String, String> {
     let dir = match skills_dir() {
         Some(d) => d,
-        None => return Err("skill discovery is disabled on this server (--skills-dir \"\").".to_string()),
+        None => {
+            return Err(
+                "skill discovery is disabled on this server (--skills-dir \"\").".to_string(),
+            )
+        }
     };
     let entries = std::fs::read_dir(&dir)
         .map_err(|e| format!("list_skills: cannot read skills dir {}: {e}", dir.display()))?;
@@ -679,7 +796,10 @@ fn tool_list_skills() -> Result<String, String> {
     }
     skills.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut out = format!("{} skills available (call read_skill <name> to learn how to use one):\n\n", skills.len());
+    let mut out = format!(
+        "{} skills available (call read_skill <name> to learn how to use one):\n\n",
+        skills.len()
+    );
     for (name, desc) in skills {
         out.push_str(&format!("- {name}: {desc}\n"));
     }
@@ -691,7 +811,11 @@ fn tool_list_skills() -> Result<String, String> {
 fn tool_read_skill(input: &Value) -> Result<String, String> {
     let dir = match skills_dir() {
         Some(d) => d,
-        None => return Err("skill discovery is disabled on this server (--skills-dir \"\").".to_string()),
+        None => {
+            return Err(
+                "skill discovery is disabled on this server (--skills-dir \"\").".to_string(),
+            )
+        }
     };
     let name = require_string(input, "name")?;
     // Guard against path escapes — skill names are single path segments.
@@ -712,11 +836,7 @@ fn tool_read_skill(input: &Value) -> Result<String, String> {
     // List files in the skill dir (names + sizes) so the model knows what
     // scripts/resources it can run/read via bash.
     let mut files: Vec<String> = Vec::new();
-    for entry in WalkDir::new(&skill_root)
-        .max_depth(3)
-        .into_iter()
-        .flatten()
-    {
+    for entry in WalkDir::new(&skill_root).max_depth(3).into_iter().flatten() {
         if entry.file_type().is_file() {
             if let Ok(rel) = entry.path().strip_prefix(&skill_root) {
                 files.push(rel.to_string_lossy().to_string());
@@ -769,7 +889,10 @@ fn tool_edit_file(input: &Value, cwd: &Path, auto_approve: bool) -> Result<Strin
         .map_err(|e| format!("edit_file: {}: {e}", path.display()))?;
     let count = content.matches(&old).count();
     if count == 0 {
-        return Err(format!("edit_file: old_string not found in {}", path.display()));
+        return Err(format!(
+            "edit_file: old_string not found in {}",
+            path.display()
+        ));
     }
     if count > 1 {
         return Err(format!(
@@ -788,11 +911,40 @@ fn tool_edit_file(input: &Value, cwd: &Path, auto_approve: bool) -> Result<Strin
     Ok(format!("edited {} (1 replacement)", path.display()))
 }
 
-/// Run `git -C <cwd> <args>` and return stdout (capped). Read-only git helpers.
+fn is_windows_git_worktree(cwd: &Path) -> bool {
+    let dotgit = cwd.join(".git");
+    if !dotgit.is_file() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(dotgit) else {
+        return false;
+    };
+    let Some(raw) = text.trim_start().strip_prefix("gitdir:") else {
+        return false;
+    };
+    let path = raw.trim().as_bytes();
+    path.len() >= 3 && path[1] == b':' && matches!(path[2], b'/' | b'\\')
+}
+
+fn shell_platform_prelude(cwd: &Path) -> &'static str {
+    if is_windows_git_worktree(cwd) {
+        "git() { git.exe \"$@\"; }\ngh() { gh.exe \"$@\"; }\npython() { python3 \"$@\"; }\n"
+    } else {
+        ""
+    }
+}
+
+/// Run git and return stdout (capped). Windows-created worktrees carry a
+/// `C:/...` gitdir pointer, so use Git for Windows from WSL for those.
 fn run_git(args: &[&str], cwd: &Path) -> Result<String, String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
+    let windows = is_windows_git_worktree(cwd);
+    let mut cmd = Command::new(if windows { "git.exe" } else { "git" });
+    if windows {
+        cmd.current_dir(cwd);
+    } else {
+        cmd.arg("-C").arg(cwd);
+    }
+    let out = cmd
         .args(args)
         .output()
         .map_err(|e| format!("git: {e} (is git installed?)"))?;
@@ -831,7 +983,11 @@ fn tool_git_diff(input: &Value, cwd: &Path) -> Result<String, String> {
 
 fn tool_git_show(input: &Value, cwd: &Path) -> Result<String, String> {
     let rev = input.get("rev").and_then(|v| v.as_str()).unwrap_or("HEAD");
-    if rev.is_empty() || !rev.chars().all(|c| c.is_ascii_alphanumeric() || "._-/~^".contains(c)) {
+    if rev.is_empty()
+        || !rev
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-/~^".contains(c))
+    {
         return Err("git_show: invalid rev (allowed: alphanumerics and . _ - / ~ ^)".to_string());
     }
     run_git(&["show", "--stat", rev], cwd)
@@ -875,7 +1031,9 @@ fn resolve_path(cwd: &Path, path_str: &str) -> Result<PathBuf, String> {
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
-        return Err(format!("path traversal with '..' is not allowed: {path_str:?}"));
+        return Err(format!(
+            "path traversal with '..' is not allowed: {path_str:?}"
+        ));
     }
     let joined = cwd.join(req);
     let root = cwd
@@ -990,6 +1148,37 @@ mod tests {
         assert!(result.content.contains("b.txt"));
     }
 
+    #[test]
+    fn list_dir_is_shallow_and_marks_directories() {
+        let dir = tmpdir();
+        let nested = dir.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("deep.txt"), "deep").unwrap();
+        fs::write(dir.join("top.txt"), "top").unwrap();
+        let call = make_call("c1", "list_dir", json!({"path": "."}));
+        let result = execute(&call, &dir, true, PermissionMode::Dangerous);
+        assert!(result.ok, "list_dir should succeed: {:?}", result.content);
+        assert!(result.content.contains("nested/"));
+        assert!(result.content.contains("top.txt"));
+        assert!(!result.content.contains("deep.txt"));
+    }
+
+    #[test]
+    fn list_dir_caps_large_directories() {
+        let dir = tmpdir();
+        for i in 0..520 {
+            fs::write(dir.join(format!("f-{i:04}.txt")), "x").unwrap();
+        }
+        let call = make_call("c1", "list_dir", json!({"path": "."}));
+        let result = execute(&call, &dir, true, PermissionMode::Dangerous);
+        assert!(result.ok);
+        assert!(
+            result.content.contains("listing truncated"),
+            "{}",
+            result.content
+        );
+    }
+
     // --- grep ---
 
     #[test]
@@ -1001,7 +1190,10 @@ mod tests {
         let result = execute(&call, &dir, true, PermissionMode::Dangerous);
         assert!(result.ok, "grep should succeed: {:?}", result.content);
         assert!(result.content.contains("hello"));
-        assert!(!result.content.contains("world"), "should not match 'world'");
+        assert!(
+            !result.content.contains("world"),
+            "should not match 'world'"
+        );
     }
 
     #[test]
@@ -1009,7 +1201,11 @@ mod tests {
         let dir = tmpdir();
         fs::write(dir.join("empty.rs"), "fn foo() {}").unwrap();
 
-        let call = make_call("c1", "grep", json!({"pattern": "XYZZY_NOT_FOUND", "path": "."}));
+        let call = make_call(
+            "c1",
+            "grep",
+            json!({"pattern": "XYZZY_NOT_FOUND", "path": "."}),
+        );
         let result = execute(&call, &dir, true, PermissionMode::Dangerous);
         assert!(result.ok);
         assert!(result.content.contains("no matches"));
@@ -1022,6 +1218,45 @@ mod tests {
         let result = execute(&call, &dir, true, PermissionMode::Dangerous);
         assert!(!result.ok);
         assert!(result.content.contains("invalid regex"));
+    }
+
+    #[test]
+    fn grep_skips_generated_directories() {
+        let dir = tmpdir();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+        fs::write(dir.join("src/keep.txt"), "needle\n").unwrap();
+        fs::write(dir.join("node_modules/pkg/skip.txt"), "needle\n").unwrap();
+        let call = make_call("c1", "grep", json!({"pattern": "needle", "path": "."}));
+        let result = execute(&call, &dir, true, PermissionMode::Dangerous);
+        assert!(result.ok, "{}", result.content);
+        assert!(
+            result.content.contains("src/keep.txt"),
+            "{}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("node_modules"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn grep_caps_match_output() {
+        let dir = tmpdir();
+        let content = (0..600)
+            .map(|i| format!("needle-{i}\n"))
+            .collect::<String>();
+        fs::write(dir.join("many.txt"), content).unwrap();
+        let call = make_call("c1", "grep", json!({"pattern": "needle", "path": "."}));
+        let result = execute(&call, &dir, true, PermissionMode::Dangerous);
+        assert!(result.ok, "{}", result.content);
+        assert!(
+            result.content.contains("search truncated"),
+            "{}",
+            result.content
+        );
     }
 
     // --- bash ---
@@ -1041,17 +1276,23 @@ mod tests {
         let call = make_call("c1", "bash", json!({"command": "exit 42"}));
         let result = execute(&call, &dir, true, PermissionMode::Dangerous);
         // ok can be true (we ran it) but the content should mention the exit code.
-        assert!(result.content.contains("42"), "should report non-zero exit code");
+        assert!(
+            result.content.contains("42"),
+            "should report non-zero exit code"
+        );
     }
 
     // --- persistent shell (terminal mode) ---
 
     fn shell_cfg(name: &str, timeout: u64) -> ShellConfig {
-        let dir = std::env::temp_dir()
-            .join(format!("chatgpt-use-shell-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("chatgpt-use-shell-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        ShellConfig { state_dir: dir, timeout_secs: timeout }
+        ShellConfig {
+            state_dir: dir,
+            timeout_secs: timeout,
+        }
     }
 
     #[test]
@@ -1059,7 +1300,8 @@ mod tests {
         let cfg = shell_cfg("cwd", 30);
         let def = std::env::temp_dir();
         // First command changes directory…
-        let r1 = run_persistent("cd /tmp && echo step1", &def, PermissionMode::Trusted, &cfg).unwrap();
+        let r1 =
+            run_persistent("cd /tmp && echo step1", &def, PermissionMode::Trusted, &cfg).unwrap();
         assert!(r1.contains("step1"), "r1: {r1}");
         // …and the next command should already be there.
         let r2 = run_persistent("pwd", &def, PermissionMode::Trusted, &cfg).unwrap();
@@ -1070,9 +1312,49 @@ mod tests {
     fn persistent_shell_keeps_exported_env() {
         let cfg = shell_cfg("env", 30);
         let def = std::env::temp_dir();
-        run_persistent("export GREETING=hi_there_42", &def, PermissionMode::Trusted, &cfg).unwrap();
+        run_persistent(
+            "export GREETING=hi_there_42",
+            &def,
+            PermissionMode::Trusted,
+            &cfg,
+        )
+        .unwrap();
         let r = run_persistent("echo $GREETING", &def, PermissionMode::Trusted, &cfg).unwrap();
-        assert!(r.contains("hi_there_42"), "exported env should persist, got: {r}");
+        assert!(
+            r.contains("hi_there_42"),
+            "exported env should persist, got: {r}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_shell_resets_when_workspace_symlink_moves() {
+        use std::os::unix::fs::symlink;
+        let cfg = shell_cfg("root-switch", 30);
+        let base = std::env::temp_dir().join(format!("cgu-root-switch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("one/sub")).unwrap();
+        fs::create_dir_all(base.join("two")).unwrap();
+        let link = base.join("current");
+        symlink(base.join("one"), &link).unwrap();
+        let first = run_persistent(
+            "cd sub && export ISSUE_LEAK=old && pwd",
+            &link,
+            PermissionMode::Trusted,
+            &cfg,
+        )
+        .unwrap();
+        assert!(first.contains("/current/sub"), "{first}");
+        fs::remove_file(&link).unwrap();
+        symlink(base.join("two"), &link).unwrap();
+        let second = run_persistent(
+            "printf '%s|%s\\n' \"$PWD\" \"${ISSUE_LEAK-unset}\"",
+            &link,
+            PermissionMode::Trusted,
+            &cfg,
+        )
+        .unwrap();
+        assert!(second.contains("/current|unset"), "{second}");
     }
 
     #[test]
@@ -1080,8 +1362,12 @@ mod tests {
         let cfg = shell_cfg("timeout", 1);
         let def = std::env::temp_dir();
         let start = Instant::now();
-        let r = run_persistent("sleep 10 && echo done", &def, PermissionMode::Trusted, &cfg).unwrap();
-        assert!(start.elapsed() < Duration::from_secs(6), "should be killed near the 1s timeout");
+        let r =
+            run_persistent("sleep 10 && echo done", &def, PermissionMode::Trusted, &cfg).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(6),
+            "should be killed near the 1s timeout"
+        );
         assert!(r.contains("timed out"), "should report a timeout, got: {r}");
         assert!(!r.contains("done"), "the command should not have completed");
     }
@@ -1107,7 +1393,11 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let s = root.join("demo-skill");
         fs::create_dir_all(&s).unwrap();
-        fs::write(s.join("SKILL.md"), "---\nname: demo-skill\ndescription: A demo.\n---\n\nRun `demo --go`.").unwrap();
+        fs::write(
+            s.join("SKILL.md"),
+            "---\nname: demo-skill\ndescription: A demo.\n---\n\nRun `demo --go`.",
+        )
+        .unwrap();
         fs::write(s.join("run.sh"), "echo hi").unwrap();
         let _ = SKILLS_DIR.set(root.clone());
 

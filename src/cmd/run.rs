@@ -122,7 +122,11 @@ fn channel_opts_from_args(args: &RunArgs) -> ChannelOptions {
     ChannelOptions {
         profile: args.channel.profile.clone(),
         session: args.channel.session.clone(),
-        project: if args.channel.temporary { String::new() } else { args.channel.project.clone() },
+        project: if args.channel.temporary {
+            String::new()
+        } else {
+            args.channel.project.clone()
+        },
         temporary: args.channel.temporary,
         timeout_secs: args.channel.timeout,
         model: args.channel.requested_model(),

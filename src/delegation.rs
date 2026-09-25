@@ -76,8 +76,7 @@ pub fn build_prompt(mode: Mode, task: &str, context: &str) -> String {
             // as plain text. This branch exists for completeness only.
             "Answer the question concisely in plain text. Do NOT output a JSON block.".to_string()
         }
-        Mode::Plan => {
-            "Produce a concrete implementation plan. \
+        Mode::Plan => "Produce a concrete implementation plan. \
             Fill `plan` with numbered steps, each with an `action` (what to do), \
             `target` (which file / function / component), and `success_criteria` \
             (how to verify it is done). Use `summary` for key architectural decisions. \
@@ -87,10 +86,9 @@ pub fn build_prompt(mode: Mode, task: &str, context: &str) -> String {
             Use `do_not_do` for explicit exclusions (what is out-of-scope). \
             Set `verdict` to \"proceed\" if the plan is ready to execute, \
             \"revise\" if you need more information, or \"blocked\" if a prerequisite \
-            is unmet.".to_string()
-        }
-        Mode::Review => {
-            "Review the provided context for correctness, clarity, security, and \
+            is unmet."
+            .to_string(),
+        Mode::Review => "Review the provided context for correctness, clarity, security, and \
             maintainability. \
             Fill `summary` with your top-level findings (one item per distinct issue \
             or positive observation). \
@@ -101,10 +99,9 @@ pub fn build_prompt(mode: Mode, task: &str, context: &str) -> String {
             Fill `do_not_do` with changes you explicitly recommend against. \
             Set `verdict` to: \"proceed\" if the code is acceptable as-is, \
             \"revise\" if it needs changes before shipping, or \"blocked\" if a \
-            fundamental design flaw prevents progress.".to_string()
-        }
-        Mode::Debug => {
-            "Diagnose the bug described in the task, using the provided context. \
+            fundamental design flaw prevents progress."
+            .to_string(),
+        Mode::Debug => "Diagnose the bug described in the task, using the provided context. \
             Fill `summary` with your root-cause analysis (what is wrong and why). \
             Fill `plan` with a numbered fix plan: each step should name the file/line \
             to change, the action to take, and a success criterion (test or observation \
@@ -115,8 +112,8 @@ pub fn build_prompt(mode: Mode, task: &str, context: &str) -> String {
             Fill `do_not_do` with tempting-but-wrong fixes to avoid. \
             Set `verdict` to \"proceed\" if the fix is clear, \"revise\" if you need \
             more context (state what exactly in `summary`), or \"blocked\" if the bug \
-            cannot be fixed without a prerequisite change.".to_string()
-        }
+            cannot be fixed without a prerequisite change."
+            .to_string(),
         Mode::Research => {
             "Research the question or topic in the task, drawing on the provided context \
             and your training knowledge. \
@@ -129,7 +126,8 @@ pub fn build_prompt(mode: Mode, task: &str, context: &str) -> String {
             sufficient to act on. \
             Set `verdict` to \"proceed\" if there is enough information to act, \
             \"revise\" if more research is required, or \"blocked\" if the question \
-            cannot be answered without external access you do not have.".to_string()
+            cannot be answered without external access you do not have."
+                .to_string()
         }
     };
 
@@ -366,21 +364,39 @@ mod tests {
     #[test]
     fn build_prompt_plan_mode_contains_task() {
         let prompt = build_prompt(Mode::Plan, "implement --json flag", "file contents here");
-        assert!(prompt.contains("implement --json flag"), "task should appear in prompt");
-        assert!(prompt.contains("file contents here"), "context should appear in prompt");
-        assert!(prompt.contains("DelegationPacket"), "schema should be in prompt");
+        assert!(
+            prompt.contains("implement --json flag"),
+            "task should appear in prompt"
+        );
+        assert!(
+            prompt.contains("file contents here"),
+            "context should appear in prompt"
+        );
+        assert!(
+            prompt.contains("DelegationPacket"),
+            "schema should be in prompt"
+        );
         assert!(prompt.contains("PLAN"), "mode label should appear");
     }
 
     #[test]
     fn build_prompt_empty_context_omits_section() {
         let prompt = build_prompt(Mode::Review, "review the code", "");
-        assert!(!prompt.contains("Gathered context"), "empty context should omit the section");
+        assert!(
+            !prompt.contains("Gathered context"),
+            "empty context should omit the section"
+        );
     }
 
     #[test]
     fn build_prompt_all_modes_compile() {
-        for mode in [Mode::Ask, Mode::Plan, Mode::Review, Mode::Debug, Mode::Research] {
+        for mode in [
+            Mode::Ask,
+            Mode::Plan,
+            Mode::Review,
+            Mode::Debug,
+            Mode::Research,
+        ] {
             let p = build_prompt(mode, "task", "ctx");
             assert!(!p.is_empty());
         }

@@ -11,8 +11,8 @@
 //!
 //! **Transport**: plain HTTP JSON-RPC 2.0 on `POST /` (or `POST /mcp`).
 //! SSE transport is not required for a first cut; add it later if ChatGPT requires
-//! streaming. The server handles requests serially — fine for an operator-local
-//! single-user setup.
+//! streaming. The accept loop stays responsive by handing requests to bounded workers;
+//! MCP tool execution is serialized to one active request while OAuth/control routes remain available.
 //!
 //! **JSON-RPC methods implemented**:
 //!   - `initialize`              → server capabilities + serverInfo
@@ -27,14 +27,51 @@ use crate::protocol::ToolCall;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{
+    mpsc::{sync_channel, TrySendError},
+    Arc,
+};
+use std::time::{Duration, Instant};
 
 // ---- Request-id counter -----------------------------------------------------
 
 /// Monotonically increasing counter used to generate unique tool-call ids.
 /// No RNG needed; a static prefix + counter is deterministic and sufficient.
 static CALL_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+const MAX_REQUEST_BODY: usize = 1024 * 1024;
+const MAX_HTTP_INFLIGHT: usize = 32;
+const MAX_OVERLOAD_QUEUE: usize = 64;
+const MCP_SOCKET_IO_TIMEOUT_SECS: u64 = 5;
+const MCP_HEADER_TIMEOUT_SECS: u64 = 10;
+const MCP_BODY_TIMEOUT_SECS: u64 = 10;
+
+struct CounterGuard {
+    counter: Arc<AtomicUsize>,
+}
+impl Drop for CounterGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct McpSlotGuard {
+    slot: Arc<AtomicBool>,
+}
+impl Drop for McpSlotGuard {
+    fn drop(&mut self) {
+        self.slot.store(false, Ordering::Release);
+    }
+}
+
+fn try_acquire_mcp_slot(slot: Arc<AtomicBool>) -> Option<McpSlotGuard> {
+    slot.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| McpSlotGuard { slot })
+}
 
 fn next_call_id() -> String {
     let n = CALL_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -182,7 +219,13 @@ fn handle_tools_list(id: &Option<Value>, read_only: bool) -> Value {
 ///   "isError": false
 /// }
 /// ```
-fn handle_tools_call(id: &Option<Value>, params: &Value, cwd: &std::path::Path, read_only: bool, perm: PermissionMode) -> Value {
+fn handle_tools_call(
+    id: &Option<Value>,
+    params: &Value,
+    cwd: &std::path::Path,
+    read_only: bool,
+    perm: PermissionMode,
+) -> Value {
     let name = match params.get("name").and_then(|v| v.as_str()) {
         Some(n) => n.to_string(),
         None => {
@@ -213,7 +256,10 @@ fn handle_tools_call(id: &Option<Value>, params: &Value, cwd: &std::path::Path, 
         input: arguments,
     };
 
-    let result = crate::tools::execute(&call, cwd, true /* auto_approve — no human in this loop */, perm);
+    let result = crate::tools::execute(
+        &call, cwd, true, /* auto_approve — no human in this loop */
+        perm,
+    );
 
     ok_response(
         id,
@@ -228,14 +274,23 @@ fn handle_tools_call(id: &Option<Value>, params: &Value, cwd: &std::path::Path, 
 
 /// Dispatch a single JSON-RPC request and return the response body, or `None`
 /// for notifications (requests without an `id`).
-fn dispatch(req: &JsonRpcRequest, cwd: &std::path::Path, read_only: bool, perm: PermissionMode) -> Option<Value> {
+fn dispatch(
+    req: &JsonRpcRequest,
+    cwd: &std::path::Path,
+    read_only: bool,
+    perm: PermissionMode,
+) -> Option<Value> {
     let id = &req.id;
 
     // Log every incoming request so connector activity is visible in mcp.log —
     // for tools/call, include the tool name + a short arg preview. This is how
     // you confirm ChatGPT's connector calls actually reach the server.
     if req.method == "tools/call" {
-        let tool = req.params.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let tool = req
+            .params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
         let preview: String = req
             .params
             .get("arguments")
@@ -274,6 +329,180 @@ fn dispatch(req: &JsonRpcRequest, cwd: &std::path::Path, read_only: bool, perm: 
     }
 }
 
+fn handle_http_request(
+    mut request: tiny_http::Request,
+    cwd: PathBuf,
+    read_only: bool,
+    permission_mode: PermissionMode,
+    oauth_mode: bool,
+    token: Option<String>,
+    mcp_slot: Arc<AtomicBool>,
+) {
+    let (url_path, url_query) = {
+        let url = request.url().to_string();
+        if let Some(idx) = url.find('?') {
+            (url[..idx].to_string(), url[idx + 1..].to_string())
+        } else {
+            (url, String::new())
+        }
+    };
+    let method = request.method().clone();
+
+    if oauth_mode {
+        let issuer = issuer_from_request(&request);
+        match (method.as_str(), url_path.as_str()) {
+            ("GET", "/.well-known/oauth-authorization-server") => {
+                let doc = crate::oauth::discovery_document(&issuer);
+                respond_json(request, 200, doc.to_string());
+                return;
+            }
+            ("GET", "/.well-known/oauth-protected-resource") => {
+                let doc = crate::oauth::protected_resource_document(&issuer);
+                respond_json(request, 200, doc.to_string());
+                return;
+            }
+            ("POST", "/register") => {
+                if let Err((status, message)) = read_body_bounded(&mut request) {
+                    respond_body_error(request, status, message);
+                    return;
+                }
+                let doc = crate::oauth::register();
+                respond_json(request, 200, doc.to_string());
+                return;
+            }
+            ("GET", "/authorize") => {
+                let html = crate::oauth::authorize_form_html(&url_query);
+                respond_html(request, 200, html);
+                return;
+            }
+            ("POST", "/authorize") => {
+                let body_str = match read_body_bounded(&mut request) {
+                    Ok(body) => body,
+                    Err((status, message)) => {
+                        respond_body_error(request, status, message);
+                        return;
+                    }
+                };
+                let mut params = crate::oauth::parse_urlencoded(&url_query);
+                params.extend(crate::oauth::parse_urlencoded(&body_str));
+                let server_password = token.as_deref().unwrap_or("");
+                match crate::oauth::authorize_submit(&params, server_password) {
+                    Ok(location) => respond_redirect(request, &location),
+                    Err(e) => respond_json(
+                        request,
+                        400,
+                        json!({"error": "access_denied", "error_description": e}).to_string(),
+                    ),
+                }
+                return;
+            }
+            ("POST", "/token") => {
+                let is_json = is_json_content_type(&request);
+                let body_str = match read_body_bounded(&mut request) {
+                    Ok(body) => body,
+                    Err((status, message)) => {
+                        respond_body_error(request, status, message);
+                        return;
+                    }
+                };
+                let params = parse_token_body(&body_str, is_json);
+                match crate::oauth::exchange_token(&params) {
+                    Ok(token_resp) => respond_oauth_json(request, 200, token_resp.to_string()),
+                    Err(crate::oauth::TokenExchangeError::InvalidGrant(e)) => respond_oauth_json(
+                        request,
+                        400,
+                        json!({"error": "invalid_grant", "error_description": e}).to_string(),
+                    ),
+                    Err(crate::oauth::TokenExchangeError::Server(e)) => respond_oauth_json(
+                        request,
+                        500,
+                        json!({"error": "server_error", "error_description": e}).to_string(),
+                    ),
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    if method != tiny_http::Method::Post || (url_path != "/" && url_path != "/mcp") {
+        respond_not_found(request);
+        return;
+    }
+
+    let authed = if oauth_mode {
+        let bearer = request.headers().iter().find_map(|h| {
+            if h.field.equiv("Authorization") {
+                h.value
+                    .as_str()
+                    .strip_prefix("Bearer ")
+                    .map(|t| t.to_string())
+            } else {
+                None
+            }
+        });
+        bearer
+            .as_deref()
+            .map(crate::oauth::validate_bearer)
+            .unwrap_or(false)
+    } else {
+        match &token {
+            Some(expected) => auth_ok(&request, expected),
+            None => true,
+        }
+    };
+
+    if !authed {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": { "code": -32000, "message": "unauthorized: invalid or missing token" }
+        })
+        .to_string();
+        if oauth_mode {
+            let issuer = issuer_from_request(&request);
+            respond_oauth_unauthorized(request, &issuer, body);
+        } else {
+            respond_json(request, 401, body);
+        }
+        return;
+    }
+
+    let _mcp_guard = match try_acquire_mcp_slot(mcp_slot) {
+        Some(guard) => guard,
+        None => {
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": { "code": -32001, "message": "MCP busy: another request is still executing" }
+            }).to_string();
+            respond_json(request, 503, body);
+            return;
+        }
+    };
+
+    let body_str = match read_body_bounded(&mut request) {
+        Ok(body) => body,
+        Err((status, message)) => {
+            respond_body_error(request, status, message);
+            return;
+        }
+    };
+
+    let (status, response_body) = match parse_jsonrpc(&body_str) {
+        Err(err_body) => (200u16, err_body.to_string()),
+        Ok(rpc_req) => match dispatch(&rpc_req, &cwd, read_only, permission_mode) {
+            None => {
+                let resp = tiny_http::Response::empty(204);
+                let _ = request.respond(resp);
+                return;
+            }
+            Some(resp_value) => (200, resp_value.to_string()),
+        },
+    };
+    respond_json(request, status, response_body);
+}
+
 // ---- Public entry point -----------------------------------------------------
 
 // ---- HTTP response helpers --------------------------------------------------
@@ -287,6 +516,59 @@ fn respond_json(request: tiny_http::Request, status: u16, body: String) {
                 .parse::<tiny_http::Header>()
                 .unwrap(),
         );
+    let _ = request.respond(resp);
+}
+
+/// Build the RFC 9728 challenge that lets an OAuth client rediscover and
+/// re-authorize this protected MCP resource after a missing/expired token.
+fn oauth_www_authenticate_value(issuer: &str) -> String {
+    let metadata_url = format!(
+        "{}/.well-known/oauth-protected-resource",
+        issuer.trim_end_matches('/')
+    );
+    let quoted = metadata_url.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("Bearer resource_metadata=\"{quoted}\"")
+}
+
+/// Send an OAuth 401 with protected-resource discovery metadata.
+fn respond_oauth_unauthorized(request: tiny_http::Request, issuer: &str, body: String) {
+    let challenge = oauth_www_authenticate_value(issuer);
+    let resp = tiny_http::Response::from_string(body)
+        .with_status_code(401)
+        .with_header(
+            "Content-Type: application/json"
+                .parse::<tiny_http::Header>()
+                .unwrap(),
+        )
+        .with_header(
+            format!("WWW-Authenticate: {challenge}")
+                .parse::<tiny_http::Header>()
+                .expect("OAuth WWW-Authenticate header must be valid"),
+        )
+        .with_header(
+            "Cache-Control: no-store"
+                .parse::<tiny_http::Header>()
+                .unwrap(),
+        )
+        .with_header("Pragma: no-cache".parse::<tiny_http::Header>().unwrap());
+    let _ = request.respond(resp);
+}
+
+/// Send an OAuth JSON response that must never be cached.
+fn respond_oauth_json(request: tiny_http::Request, status: u16, body: String) {
+    let resp = tiny_http::Response::from_string(body)
+        .with_status_code(status)
+        .with_header(
+            "Content-Type: application/json"
+                .parse::<tiny_http::Header>()
+                .unwrap(),
+        )
+        .with_header(
+            "Cache-Control: no-store"
+                .parse::<tiny_http::Header>()
+                .unwrap(),
+        )
+        .with_header("Pragma: no-cache".parse::<tiny_http::Header>().unwrap());
     let _ = request.respond(resp);
 }
 
@@ -315,6 +597,56 @@ fn respond_redirect(request: tiny_http::Request, location: &str) {
 /// Send a 404 JSON response.
 fn respond_not_found(request: tiny_http::Request) {
     respond_json(request, 404, r#"{"error":"not found"}"#.to_string());
+}
+
+fn read_body_bounded(
+    request: &mut tiny_http::Request,
+) -> std::result::Result<String, (u16, String)> {
+    if request
+        .body_length()
+        .is_some_and(|len| len > MAX_REQUEST_BODY)
+    {
+        return Err((
+            413,
+            format!("request body exceeds {MAX_REQUEST_BODY} bytes"),
+        ));
+    }
+    let deadline = Instant::now() + Duration::from_secs(MCP_BODY_TIMEOUT_SECS);
+    let mut body = Vec::with_capacity(request.body_length().unwrap_or(0).min(MAX_REQUEST_BODY));
+    let mut buf = [0u8; 8192];
+    let reader = request.as_reader();
+    loop {
+        if Instant::now() >= deadline {
+            return Err((408, "request body deadline exceeded".to_string()));
+        }
+        let remaining = MAX_REQUEST_BODY + 1 - body.len();
+        if remaining == 0 {
+            return Err((
+                413,
+                format!("request body exceeds {MAX_REQUEST_BODY} bytes"),
+            ));
+        }
+        let want = remaining.min(buf.len());
+        match reader.read(&mut buf[..want]) {
+            Ok(0) => break,
+            Ok(n) => body.extend_from_slice(&buf[..n]),
+            Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                return Err((408, "request body read timed out".to_string()));
+            }
+            Err(e) => return Err((400, format!("failed to read request body: {e}"))),
+        }
+    }
+    if body.len() > MAX_REQUEST_BODY {
+        return Err((
+            413,
+            format!("request body exceeds {MAX_REQUEST_BODY} bytes"),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+fn respond_body_error(request: tiny_http::Request, status: u16, message: String) {
+    respond_json(request, status, json!({"error": message}).to_string());
 }
 
 // ---- Issuer derivation ------------------------------------------------------
@@ -373,16 +705,39 @@ pub fn run(args: &McpArgs) -> Result<()> {
 
     let read_only = matches!(args.profile, crate::cli::ToolProfile::ReadOnly);
     // Effective token: --token wins, else the one saved by `chatgpt-use init`.
-    let token: Option<String> = args
-        .token
-        .clone()
-        .or_else(crate::cmd::init::load_token);
-
-    let bind_addr = format!("{}:{}", args.host, args.port);
-    let server = tiny_http::Server::http(&bind_addr)
-        .map_err(|e| anyhow::anyhow!("failed to bind MCP server on {bind_addr}: {e}"))?;
+    let token: Option<String> = args.token.clone().or_else(crate::cmd::init::load_token);
+    if token
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| value.is_empty())
+    {
+        return Err(anyhow::anyhow!(
+            "MCP authentication secret must not be empty"
+        ));
+    }
 
     let oauth_mode = args.auth_mode == AuthMode::OAuth;
+    if oauth_mode {
+        let password = token.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("OAuth mode requires a configured server password; run `chatgpt-use init` or pass --token")
+        })?;
+        let identity_material = format!(
+            "mcp-oauth-v1|host={}|port={}|profile={:?}|permission={:?}|password={}",
+            args.host, args.port, args.profile, args.permission_mode, password
+        );
+        crate::oauth::configure_persistent_store(&identity_material)
+            .map_err(|e| anyhow::anyhow!("failed to initialize OAuth token store: {e}"))?;
+    }
+
+    let bind_addr = format!("{}:{}", args.host, args.port);
+    let connection_policy = tiny_http::ConnectionPolicy {
+        single_request: true,
+        read_timeout: Some(Duration::from_secs(MCP_SOCKET_IO_TIMEOUT_SECS)),
+        write_timeout: Some(Duration::from_secs(MCP_SOCKET_IO_TIMEOUT_SECS)),
+        header_timeout: Some(Duration::from_secs(MCP_HEADER_TIMEOUT_SECS)),
+    };
+    let server = tiny_http::Server::http_with_connection_policy(&bind_addr, connection_policy)
+        .map_err(|e| anyhow::anyhow!("failed to bind MCP server on {bind_addr}: {e}"))?;
 
     eprintln!("[mcp] listening on http://{bind_addr}");
     eprintln!("[mcp] cwd: {}", cwd.display());
@@ -430,181 +785,84 @@ pub fn run(args: &McpArgs) -> Result<()> {
             .map(|p| p.join(".claude").join("skills"))
             .unwrap_or_default();
         // configure_skills not called → tools fall back to ~/.claude/skills.
-        eprintln!("[mcp] skills: list_skills/read_skill → {} (default)", default.display());
+        eprintln!(
+            "[mcp] skills: list_skills/read_skill → {} (default)",
+            default.display()
+        );
     }
     if oauth_mode {
-        // In OAuth mode, the server password = the resolved token.
-        match &token {
-            Some(pw) => eprintln!("[mcp] auth: OAuth 2.1 + PKCE — password: {pw}"),
-            None => eprintln!("[mcp] auth: OAuth 2.1 + PKCE — WARNING: no password set (run `chatgpt-use init` or pass --token)"),
-        }
+        eprintln!("[mcp] auth: OAuth 2.1 + PKCE — password configured");
     } else if token.is_some() {
         eprintln!("[mcp] auth: Bearer token required");
     } else {
         eprintln!("[mcp] auth: NONE — consider --token when tunneling");
     }
     eprintln!("[mcp] tunnel hint: expose with  cloudflared tunnel --url http://{bind_addr}");
-    eprintln!("[mcp]   then register the public URL in ChatGPT > Settings > Apps > Add custom connector");
+    eprintln!(
+        "[mcp]   then register the public URL in ChatGPT > Settings > Apps > Add custom connector"
+    );
 
-    // Serve requests serially — fine for an operator-local single-user setup.
+    let mcp_slot = Arc::new(AtomicBool::new(false));
+    let http_inflight = Arc::new(AtomicUsize::new(0));
+    // Keep overload handling bounded too. A slow client that never reads its 503
+    // may occupy this one responder, but it cannot create an unbounded number of
+    // reject threads; once the bounded queue fills, new overload requests are
+    // dropped (closing their connections) directly from the accept loop.
+    let (overload_tx, overload_rx) = sync_channel::<tiny_http::Request>(MAX_OVERLOAD_QUEUE);
+    std::thread::Builder::new()
+        .name("mcp-http-overload".to_string())
+        .spawn(move || {
+            while let Ok(request) = overload_rx.recv() {
+                respond_json(
+                    request,
+                    503,
+                    json!({"error": "server busy: too many concurrent HTTP requests"}).to_string(),
+                );
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("failed to spawn bounded HTTP overload responder: {e}"))?;
+
     loop {
-        let mut request = server.recv()?;
-
-        // Read the body before anything else (tiny_http::Request needs &mut for body).
-        let mut body_buf = Vec::new();
-        std::io::copy(request.as_reader(), &mut body_buf)?;
-        let body_str = String::from_utf8_lossy(&body_buf).into_owned();
-
-        // Parse the URL into path and raw query string.
-        let (url_path, url_query) = {
-            let url = request.url().to_string();
-            if let Some(idx) = url.find('?') {
-                (url[..idx].to_string(), url[idx + 1..].to_string())
-            } else {
-                (url, String::new())
-            }
-        };
-
-        let method = request.method().clone();
-
-        // -----------------------------------------------------------------
-        // OAuth routes — handled BEFORE the JSON-RPC path.
-        // -----------------------------------------------------------------
-        if oauth_mode {
-            let issuer = issuer_from_request(&request);
-
-            match (method.as_str(), url_path.as_str()) {
-                // RFC 8414 discovery
-                ("GET", "/.well-known/oauth-authorization-server") => {
-                    let doc = crate::oauth::discovery_document(&issuer);
-                    respond_json(request, 200, doc.to_string());
-                    continue;
+        let request = server.recv()?;
+        let previous = http_inflight.fetch_add(1, Ordering::AcqRel);
+        if previous >= MAX_HTTP_INFLIGHT {
+            http_inflight.fetch_sub(1, Ordering::AcqRel);
+            match overload_tx.try_send(request) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_request)) => {
+                    // Dropping the request closes the connection. Never block the
+                    // accept loop waiting for a slow overload client.
                 }
-                // RFC 9728 protected resource metadata
-                ("GET", "/.well-known/oauth-protected-resource") => {
-                    let doc = crate::oauth::protected_resource_document(&issuer);
-                    respond_json(request, 200, doc.to_string());
-                    continue;
-                }
-                // Dynamic client registration
-                ("POST", "/register") => {
-                    let doc = crate::oauth::register();
-                    respond_json(request, 200, doc.to_string());
-                    continue;
-                }
-                // Authorization form (GET shows the password form)
-                ("GET", "/authorize") => {
-                    let html = crate::oauth::authorize_form_html(&url_query);
-                    respond_html(request, 200, html);
-                    continue;
-                }
-                // Authorization form submission (POST from the browser form)
-                ("POST", "/authorize") => {
-                    // Merge query params + form body so hidden fields survive.
-                    let mut params = crate::oauth::parse_urlencoded(&url_query);
-                    let form_params = crate::oauth::parse_urlencoded(&body_str);
-                    params.extend(form_params);
-
-                    let server_password = token.as_deref().unwrap_or("");
-                    match crate::oauth::authorize_submit(&params, server_password) {
-                        Ok(location) => {
-                            respond_redirect(request, &location);
-                        }
-                        Err(e) => {
-                            respond_json(
-                                request,
-                                400,
-                                json!({"error": "access_denied", "error_description": e}).to_string(),
-                            );
-                        }
-                    }
-                    continue;
-                }
-                // Token endpoint
-                ("POST", "/token") => {
-                    let is_json = is_json_content_type(&request);
-                    let params = parse_token_body(&body_str, is_json);
-                    match crate::oauth::exchange_token(&params) {
-                        Ok(token_resp) => {
-                            respond_json(request, 200, token_resp.to_string());
-                        }
-                        Err(e) => {
-                            respond_json(
-                                request,
-                                400,
-                                json!({"error": "invalid_grant", "error_description": e}).to_string(),
-                            );
-                        }
-                    }
-                    continue;
-                }
-                _ => {
-                    // Falls through to MCP JSON-RPC handling below (or 404).
+                Err(TrySendError::Disconnected(_request)) => {
+                    eprintln!("[mcp] overload responder stopped; dropping busy request");
                 }
             }
-        }
-
-        // -----------------------------------------------------------------
-        // MCP JSON-RPC path — POST / or POST /mcp only.
-        // -----------------------------------------------------------------
-        if method != tiny_http::Method::Post
-            || (url_path != "/" && url_path != "/mcp")
-        {
-            respond_not_found(request);
             continue;
         }
 
-        // Auth gate — Token mode: check Bearer header or ?token= query param.
-        // Auth gate — OAuth mode: require a valid Bearer issued by our token endpoint.
-        let authed = if oauth_mode {
-            // Extract Bearer from Authorization header.
-            let bearer = request.headers().iter().find_map(|h| {
-                if h.field.equiv("Authorization") {
-                    h.value.as_str().strip_prefix("Bearer ").map(|t| t.to_string())
-                } else {
-                    None
-                }
+        let counter = http_inflight.clone();
+        let guard = CounterGuard { counter };
+        let request_cwd = cwd.clone();
+        let request_token = token.clone();
+        let request_mcp_slot = mcp_slot.clone();
+        let permission_mode = args.permission_mode;
+        let spawn = std::thread::Builder::new()
+            .name("mcp-http-worker".to_string())
+            .spawn(move || {
+                let _http_guard = guard;
+                handle_http_request(
+                    request,
+                    request_cwd,
+                    read_only,
+                    permission_mode,
+                    oauth_mode,
+                    request_token,
+                    request_mcp_slot,
+                );
             });
-            match bearer {
-                Some(ref t) => crate::oauth::validate_bearer(t),
-                None => false,
-            }
-        } else {
-            // Token mode: existing behaviour — no token = open, token = must match.
-            match &token {
-                Some(expected) => auth_ok(&request, expected),
-                None => true,
-            }
-        };
-
-        if !authed {
-            let body = json!({
-                "jsonrpc": "2.0",
-                "id": null,
-                "error": { "code": -32000, "message": "unauthorized: invalid or missing token" }
-            })
-            .to_string();
-            respond_json(request, 401, body);
-            continue;
+        if let Err(e) = spawn {
+            eprintln!("[mcp] failed to spawn HTTP worker: {e}");
         }
-
-        // Parse JSON-RPC.
-        let (status, response_body) = match parse_jsonrpc(&body_str) {
-            Err(err_body) => (200u16, err_body.to_string()),
-            Ok(rpc_req) => {
-                match dispatch(&rpc_req, &cwd, read_only, args.permission_mode) {
-                    None => {
-                        // Notification — send empty 204.
-                        let resp = tiny_http::Response::empty(204);
-                        let _ = request.respond(resp);
-                        continue;
-                    }
-                    Some(resp_value) => (200, resp_value.to_string()),
-                }
-            }
-        };
-
-        respond_json(request, status, response_body);
     }
 }
 
@@ -614,6 +872,18 @@ pub fn run(args: &McpArgs) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn oauth_401_challenge_advertises_protected_resource_metadata() {
+        assert_eq!(
+            oauth_www_authenticate_value("https://example.test"),
+            "Bearer resource_metadata=\"https://example.test/.well-known/oauth-protected-resource\""
+        );
+        assert_eq!(
+            oauth_www_authenticate_value("https://example.test/"),
+            "Bearer resource_metadata=\"https://example.test/.well-known/oauth-protected-resource\""
+        );
+    }
 
     // --- parse_jsonrpc ---
 
@@ -666,11 +936,10 @@ mod tests {
     fn tools_list_contains_all_builtins() {
         let id = Some(json!("req-1"));
         let resp = handle_tools_list(&id, false);
-        let tools = resp["result"]["tools"].as_array().expect("tools should be array");
-        let names: Vec<&str> = tools
-            .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
+        let tools = resp["result"]["tools"]
+            .as_array()
+            .expect("tools should be array");
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
         assert!(names.contains(&"list_dir"));
@@ -689,16 +958,30 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"read_file") && names.contains(&"list_dir") && names.contains(&"grep"));
-        assert!(!names.contains(&"write_file"), "write_file must be hidden in read-only");
+        assert!(
+            names.contains(&"read_file") && names.contains(&"list_dir") && names.contains(&"grep")
+        );
+        assert!(
+            !names.contains(&"write_file"),
+            "write_file must be hidden in read-only"
+        );
         assert!(!names.contains(&"bash"), "bash must be hidden in read-only");
 
         // tools/call to a write tool under read-only is refused with isError.
         let params = json!({ "name": "bash", "arguments": { "command": "echo hi" } });
-        let resp = handle_tools_call(&id, &params, &std::env::temp_dir(), true, PermissionMode::Dangerous);
+        let resp = handle_tools_call(
+            &id,
+            &params,
+            &std::env::temp_dir(),
+            true,
+            PermissionMode::Dangerous,
+        );
         assert_eq!(resp["result"]["isError"], json!(true));
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("read-only"), "should explain the read-only profile: {text}");
+        assert!(
+            text.contains("read-only"),
+            "should explain the read-only profile: {text}"
+        );
     }
 
     #[test]
@@ -769,7 +1052,12 @@ mod tests {
             method: "notifications/initialized".to_string(),
             params: Value::Null,
         };
-        let result = dispatch(&rpc, &std::env::temp_dir(), false, PermissionMode::Dangerous);
+        let result = dispatch(
+            &rpc,
+            &std::env::temp_dir(),
+            false,
+            PermissionMode::Dangerous,
+        );
         assert!(result.is_none(), "notifications should produce no response");
     }
 
@@ -780,7 +1068,13 @@ mod tests {
             method: "bogus/method".to_string(),
             params: Value::Null,
         };
-        let result = dispatch(&rpc, &std::env::temp_dir(), false, PermissionMode::Dangerous).unwrap();
+        let result = dispatch(
+            &rpc,
+            &std::env::temp_dir(),
+            false,
+            PermissionMode::Dangerous,
+        )
+        .unwrap();
         assert_eq!(result["error"]["code"], -32601);
     }
 
