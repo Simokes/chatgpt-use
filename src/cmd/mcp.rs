@@ -1046,6 +1046,38 @@ mod tests {
     // --- dispatch ---
 
     #[test]
+    fn dispatch_tools_call_smoke_covers_list_dir_and_bash_pwd() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("mcp-dispatch-smoke-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("smoke-marker.txt"), "ok").unwrap();
+
+        let list = JsonRpcRequest {
+            id: Some(json!("list")),
+            method: "tools/call".to_string(),
+            params: json!({"name":"list_dir","arguments":{"path":"."}}),
+        };
+        let list_resp = dispatch(&list, &dir, false, PermissionMode::Dangerous).unwrap();
+        assert_eq!(list_resp["result"]["isError"], false);
+        let list_text = list_resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(list_text.contains("smoke-marker.txt"), "{list_text}");
+
+        let bash = JsonRpcRequest {
+            id: Some(json!("bash")),
+            method: "tools/call".to_string(),
+            params: json!({"name":"bash","arguments":{"command":"pwd"}}),
+        };
+        let bash_resp = dispatch(&bash, &dir, false, PermissionMode::Dangerous).unwrap();
+        assert_eq!(bash_resp["result"]["isError"], false);
+        let bash_text = bash_resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            bash_text.contains(&dir.display().to_string()),
+            "bash pwd should run in MCP cwd: {bash_text}"
+        );
+    }
+
+    #[test]
     fn dispatch_notification_returns_none() {
         let rpc = JsonRpcRequest {
             id: None,

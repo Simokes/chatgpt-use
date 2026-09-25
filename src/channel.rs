@@ -760,8 +760,6 @@ fn js_open_project_in_place(gizmo_id: &str) -> String {
 // "6Pro" on one account inside three weeks, so any word list goes stale. What is
 // stable is its relationship to the active composer. Project root, blank chat,
 // and existing conversations move the composer, so never use page-global position.
-const EFFORT_SHORTCUT: &str = "Control+Shift+M";
-
 // JS: locate the active composer's intelligence picker without using page-global
 // coordinates. The composer moves between project root, blank chat, and an
 // existing conversation; the trailing slot is stable across those layouts.
@@ -849,34 +847,9 @@ fn js_set_slider_index(target: i64) -> String {
     )
 }
 
-
 // JS: read the opened picker — the effort slider (index + thumb position) and
 // the model-family radios. `level` is the name the page currently shows for the
 // slider position; it is for logging only, never for matching.
-const JS_CURRENT_MODEL_CONFIG: &str = r#"(() => {
-  try {
-    const raw = localStorage.getItem('oai/apps/tpp/last-started-model-config');
-    const cfg = raw ? JSON.parse(raw) : null;
-    return JSON.stringify({modelSlug: cfg?.modelSlug || '', thinkingEffort: cfg?.thinkingEffort || ''});
-  } catch (_) {
-    return JSON.stringify({modelSlug: '', thinkingEffort: ''});
-  }
-})()"#;
-
-fn normalize_model_family(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .map(|c| c.to_ascii_lowercase())
-        .collect()
-}
-
-fn model_family_matches_state(want: &str, slug: &str) -> bool {
-    let want = normalize_model_family(want);
-    let slug = normalize_model_family(slug);
-    !want.is_empty() && (slug == want || slug.starts_with(&want))
-}
-
 const JS_PICKER_MENU: &str = r#"(() => {
   const menu = document.querySelector('[role="menu"]');
   const sl = document.querySelector('[role="slider"]');
@@ -1433,7 +1406,11 @@ impl Channel {
         }
         ab_cmd(
             &self.ab,
-            &["upload", r#"form input[type="file"][multiple]:not([accept*="image"])"#, path],
+            &[
+                "upload",
+                r#"form input[type="file"][multiple]:not([accept*="image"])"#,
+                path,
+            ],
             &self.session,
             30.0,
         )
@@ -1679,15 +1656,10 @@ impl Channel {
             // Enter didn't take. Submit through the composer's owning form.
             // Current ChatGPT ignores synthetic button clicks but accepts the
             // form's native requestSubmit() path.
-            let submitted = ab_eval(
-                &self.ab,
-                JS_SUBMIT_COMPOSER,
-                &self.session,
-                budget,
-            )
-            .ok()
-            .and_then(|v| v.get("ok").and_then(|x| x.as_bool()))
-            == Some(true);
+            let submitted = ab_eval(&self.ab, JS_SUBMIT_COMPOSER, &self.session, budget)
+                .ok()
+                .and_then(|v| v.get("ok").and_then(|x| x.as_bool()))
+                == Some(true);
 
             if !submitted {
                 // Compatibility fallback for older surfaces.
@@ -2341,7 +2313,8 @@ impl Channel {
                                  still never observed the submitted message land (user turn \
                                  count never rose above {baseline_users}); giving up instead of \
                                  polling silently until the {}s timeout",
-                                total_reattaches - 1, self.timeout_secs,
+                                total_reattaches - 1,
+                                self.timeout_secs,
                             );
                         }
                         self.reopen_pinned(remaining_secs())
@@ -2382,7 +2355,8 @@ impl Channel {
                                 "reattached to the pinned conversation {} times this turn and \
                                  the page still never settled on it; giving up instead of \
                                  polling silently until the {}s timeout",
-                                total_reattaches - 1, self.timeout_secs,
+                                total_reattaches - 1,
+                                self.timeout_secs,
                             );
                         }
                         self.reopen_pinned(remaining_secs())
@@ -2806,7 +2780,10 @@ impl Channel {
             }
         }
         if !pick.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-            let detail = pick.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let detail = pick
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             bail!("could not find the composer model picker: {detail}");
         }
         if let Some(idx) = want_level {
@@ -2830,12 +2807,10 @@ impl Channel {
             if open_attempt > 0 {
                 pick = ab_eval(&self.ab, JS_FIND_PICKER, &self.session, remaining())?;
             }
-            let opened_by_pointer = ab_eval(
-                &self.ab, JS_OPEN_PICKER, &self.session, remaining(),
-            )
-            .ok()
-            .and_then(|v| v.get("ok").and_then(|x| x.as_bool()))
-            == Some(true);
+            let opened_by_pointer = ab_eval(&self.ab, JS_OPEN_PICKER, &self.session, remaining())
+                .ok()
+                .and_then(|v| v.get("ok").and_then(|x| x.as_bool()))
+                == Some(true);
             if !opened_by_pointer {
                 let (px, py) = match (
                     pick.get("x").and_then(|v| v.as_i64()),
@@ -2963,21 +2938,39 @@ impl Channel {
         remaining: &dyn Fn() -> f64,
     ) -> Result<()> {
         let empty = vec![];
-        let radios = st.get("radios").and_then(|v| v.as_array()).unwrap_or(&empty);
+        let radios = st
+            .get("radios")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&empty);
         let names: Vec<String> = radios
             .iter()
-            .filter_map(|r| r.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .filter_map(|r| {
+                r.get("text")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
             .collect();
         let wl = want.to_lowercase();
-        let hit = names.iter().find(|n| n.to_lowercase() == wl).cloned().or_else(|| {
-            names.iter().find(|n| n.to_lowercase().contains(&wl)).cloned()
-        });
+        let hit = names
+            .iter()
+            .find(|n| n.to_lowercase() == wl)
+            .cloned()
+            .or_else(|| {
+                names
+                    .iter()
+                    .find(|n| n.to_lowercase().contains(&wl))
+                    .cloned()
+            });
         let Some(hit) = hit else {
             bail!(
                 "{want:?} is neither a thinking-effort level ({}) nor one of the \\
                  models this account offers ({})",
                 LEVEL_ORDER.join(", "),
-                if names.is_empty() { "none listed".to_string() } else { names.join(", ") }
+                if names.is_empty() {
+                    "none listed".to_string()
+                } else {
+                    names.join(", ")
+                }
             );
         };
 
@@ -2988,7 +2981,6 @@ impl Channel {
         eprintln!("model: {hit}");
         Ok(())
     }
-
 }
 
 // ---- chrome-use helpers (mirrors _ab / _ab_eval in chatgpt-imagegen) --------
@@ -3771,13 +3763,6 @@ mod tests {
     }
 
     #[test]
-    fn current_model_state_can_verify_family_without_opening_picker() {
-        assert!(model_family_matches_state("GPT-5.6 Sol", "gpt-5.6-sol-wm"));
-        assert!(!model_family_matches_state("GPT-5.5", "gpt-5.6-sol-wm"));
-        assert!(JS_CURRENT_MODEL_CONFIG.contains("last-started-model-config"));
-    }
-
-    #[test]
     fn picker_probe_is_structural_not_text_matched() {
         // Current ChatGPT exposes a stable intelligence trigger on the active
         // composer form. Keep the probe structural and independent of localized
@@ -3786,12 +3771,128 @@ mod tests {
         assert!(JS_FIND_PICKER.contains("closest('form')"));
         assert!(!JS_FIND_PICKER.to_lowercase().contains("instant"));
         assert!(JS_OPEN_PICKER.contains("PointerEvent('pointerdown'"));
-        assert!(JS_PICKER_MENU.contains("composer-intelligence-picker-content") || JS_PICKER_MENU.contains("[role=\"menu\"]"));
+        assert!(
+            JS_PICKER_MENU.contains("composer-intelligence-picker-content")
+                || JS_PICKER_MENU.contains("[role=\"menu\"]")
+        );
         assert!(JS_PICKER_MENU.contains(r#"[role="slider"]"#));
         assert!(JS_PICKER_MENU.contains("aria-valuenow"));
     }
 
     use super::*;
+
+    #[cfg(unix)]
+    fn fake_chrome_use(name: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "chatgpt-use-browser-smoke-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("chrome-use");
+        let log = dir.join("calls.log");
+        let script = r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> '__LOG__'
+cmd="${1-}"
+if [ "$cmd" = "eval" ]; then
+  js="${2-}"
+  if printf '%s' "$js" | grep -q 'const present ='; then
+    printf '%s\n' '"{\"present\":true}"'
+  elif printf '%s' "$js" | grep -q 'already_open'; then
+    printf '%s\n' '"{\"ok\":true,\"already_open\":false}"'
+  elif printf '%s' "$js" | grep -q 'thinking-effort slider not found'; then
+    printf '%s\n' '"{\"ok\":true,\"before\":1,\"target\":2}"'
+  elif printf '%s' "$js" | grep -q 'for (const el of document.querySelectorAll'; then
+    printf '%s\n' '"{\"ok\":true}"'
+  elif printf '%s' "$js" | grep -q 'const menu = document.querySelector'; then
+    printf '%s\n' '"{\"open\":true,\"slider\":{\"now\":2,\"min\":0,\"max\":3},\"radios\":[{\"text\":\"GPT-5.6 Sol\",\"checked\":false}],\"level\":\"High\"}"'
+  elif printf '%s' "$js" | grep -q 'conversation not in the sidebar'; then
+    printf '%s\n' '"{\"ok\":true}"'
+  elif printf '%s' "$js" | grep -q 'limited:'; then
+    printf '%s\n' '"{\"limited\":false,\"composer\":true}"'
+  elif printf '%s' "$js" | grep -q 'composer intelligence trigger not found'; then
+    printf '%s\n' '"{\"ok\":true,\"label\":\"\",\"effort\":\"\",\"expanded\":false,\"x\":10,\"y\":20}"'
+  else
+    printf '%s\n' '"{}"'
+  fi
+fi
+"#
+        .replace("__LOG__", &log.display().to_string());
+        std::fs::write(&bin, script).unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        (bin, log)
+    }
+
+    #[cfg(unix)]
+    fn fake_channel(ab: PathBuf, convo_id: Option<&str>) -> Channel {
+        Channel {
+            ab,
+            session: "unit-browser".to_string(),
+            timeout_secs: 10,
+            project: String::new(),
+            convo_id: convo_id.map(str::to_string),
+            pending_project: None,
+            submitted: false,
+            receipt: None,
+            _surface: SurfaceLock { _file: None },
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn select_model_executes_picker_family_and_effort_paths() {
+        let (ab, log) = fake_chrome_use("picker");
+        let channel = fake_channel(ab, None);
+        channel
+            .select_model("GPT-5.6 Sol", Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        channel
+            .select_model("high", Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert!(calls.contains("PointerEvent('pointerdown'"), "{calls}");
+        assert!(calls.contains("menuitemradio"), "{calls}");
+        assert!(
+            calls.contains("role=\\\"slider\\\"") || calls.contains("role=\"slider\""),
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attach_file_executes_upload_and_waits_for_composer_chip() {
+        let (ab, log) = fake_chrome_use("attach");
+        let channel = fake_channel(ab, None);
+        channel.attach_file("/tmp/coordinator-context.txt").unwrap();
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert!(
+            calls.contains("upload form input[type=\"file\"][multiple]:not([accept*=\"image\"])"),
+            "{calls}"
+        );
+        assert!(calls.contains("/tmp/coordinator-context.txt"), "{calls}");
+        assert!(calls.contains("const present ="), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reopen_pinned_prefers_in_place_conversation_and_confirms_composer() {
+        let (ab, log) = fake_chrome_use("reopen");
+        let channel = fake_channel(ab, Some("6ab6d791-b9c4-83eb-97c2-95d06acc799f"));
+        channel.reopen_pinned(20.0).unwrap();
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert!(calls.contains("conversation not in the sidebar"), "{calls}");
+        assert!(calls.contains("limited:"), "{calls}");
+        assert!(
+            !calls
+                .lines()
+                .any(|line| line.starts_with("open https://chatgpt.com/c/")),
+            "successful SPA reattach should not hard-navigate: {calls}"
+        );
+    }
 
     #[test]
     fn convo_drift_allows_the_same_conversation() {
@@ -3819,12 +3920,21 @@ mod tests {
         assert!(JS_STATE.contains(r#"[data-content-search-unit-key$=":user"]"#));
         assert!(JS_STATE.contains(r#"[data-content-search-unit-key$=":assistant"]"#));
         assert!(JS_LAST_ASSISTANT.contains(r#"[data-markdown-text-style="assistant-message"]"#));
-        for js in [JS_COMPOSER, JS_CLEAR_COMPOSER, JS_COMPOSER_FINGERPRINT, JS_COMMIT_COMPOSER_BUFFER] {
+        for js in [
+            JS_COMPOSER,
+            JS_CLEAR_COMPOSER,
+            JS_COMPOSER_FINGERPRINT,
+            JS_COMMIT_COMPOSER_BUFFER,
+        ] {
             assert!(js.contains("#prompt-textarea"), "{js}");
-            assert!(js.contains(r#"div.ProseMirror[contenteditable="true"][role="textbox"]"#), "{js}");
+            assert!(
+                js.contains(r#"div.ProseMirror[contenteditable="true"][role="textbox"]"#),
+                "{js}"
+            );
         }
         assert!(COMPOSER_SELECTOR.contains("#prompt-textarea"));
-        assert!(COMPOSER_SELECTOR.contains(r#"div.ProseMirror[contenteditable="true"][role="textbox"]"#));
+        assert!(COMPOSER_SELECTOR
+            .contains(r#"div.ProseMirror[contenteditable="true"][role="textbox"]"#));
         assert!(JS_FIND_PICKER.contains("data-codex-intelligence-trigger"));
         assert!(JS_FIND_PICKER.contains("closest('form')"));
         assert!(JS_OPEN_PICKER.contains("PointerEvent('pointerdown'"));
