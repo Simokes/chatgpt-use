@@ -1,4 +1,4 @@
-//! `status <request-id>` — report what happened to an `ask --request-id`
+//! `status <request-id>` — report what happened to an `ask/work --request-id`
 //! request, from its receipt alone. It never touches the browser, so it
 //! answers even while another run holds the ChatGPT window.
 
@@ -29,6 +29,7 @@ pub fn run(args: &StatusArgs) -> Result<()> {
             "submitted": submitted,
             "conversation_id": r.conversation_id,
             "outcome": r.outcome,
+            "error_kind": r.error_kind,
             "error": r.error,
             "created_at": r.created_at,
             "updated_at": r.updated_at,

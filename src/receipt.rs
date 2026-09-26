@@ -1,4 +1,4 @@
-//! Request receipts for `ask --request-id`: a durable record of one request,
+//! Request receipts for `ask/work --request-id`: a durable record of one request,
 //! written before anything is sent and updated until the turn ends, so a
 //! caller that lost track of it (a timeout, a crash, a kill) can ask what
 //! happened instead of sending the prompt again.
@@ -26,6 +26,8 @@ pub struct Receipt {
     pub updated_at: u64,
     /// The result envelope's status once the turn ended (completed, incomplete, …).
     pub outcome: Option<String>,
+    /// Stable machine-readable failure kind from the structured envelope.
+    pub error_kind: Option<String>,
     pub error: Option<String>,
 }
 
@@ -41,6 +43,7 @@ impl Receipt {
             created_at: now,
             updated_at: now,
             outcome: None,
+            error_kind: None,
             error: None,
         }
     }
@@ -133,6 +136,7 @@ pub fn finish(path: &Path, envelope: &serde_json::Value) {
             .unwrap_or("unknown")
             .to_string()
     };
+    let error_kind = envelope["error"]["kind"].as_str().map(str::to_string);
     let error = envelope["error"]["message"].as_str().map(str::to_string);
     let convo = envelope["conversation_id"].as_str().map(str::to_string);
     update(path, |r| {
@@ -143,6 +147,7 @@ pub fn finish(path: &Path, envelope: &serde_json::Value) {
             r.submitted = submitted;
         }
         r.outcome = Some(status);
+        r.error_kind = error_kind;
         r.error = error;
         if convo.is_some() {
             r.conversation_id = convo;
@@ -230,6 +235,50 @@ mod tests {
         assert_eq!(live_state(&r, |_| false), "detached");
         r.state = "completed".into();
         assert_eq!(live_state(&r, |_| false), "completed");
+    }
+
+    #[test]
+    fn finish_persists_machine_readable_error_kind() {
+        let dir = std::env::temp_dir().join(format!("cgu-receipt-kind-{}", std::process::id()));
+        let path = dir.join("r.json");
+        let r = Receipt::accepted("kind");
+        assert!(create(&path, &r).unwrap());
+        finish(
+            &path,
+            &serde_json::json!({
+                "status": "unavailable",
+                "error": {
+                    "kind": "rate_limited",
+                    "message": "429",
+                    "submitted": "no"
+                }
+            }),
+        );
+        let saved = load(&path).unwrap();
+        assert_eq!(saved.state, "failed");
+        assert_eq!(saved.submitted, "no");
+        assert_eq!(saved.outcome.as_deref(), Some("unavailable"));
+        assert_eq!(saved.error_kind.as_deref(), Some("rate_limited"));
+        assert_eq!(saved.error.as_deref(), Some("429"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn old_receipts_without_error_kind_remain_readable() {
+        let raw = r#"{
+            "request_id":"legacy",
+            "state":"failed",
+            "submitted":"no",
+            "conversation_id":null,
+            "pid":1,
+            "created_at":1,
+            "updated_at":1,
+            "outcome":"unavailable",
+            "error":"legacy"
+        }"#;
+        let receipt: Receipt = serde_json::from_str(raw).unwrap();
+        assert_eq!(receipt.error_kind, None);
+        assert_eq!(receipt.error.as_deref(), Some("legacy"));
     }
 
     #[test]

@@ -37,20 +37,20 @@ pub enum Command {
     /// Refresh the chatgpt-use connector in ChatGPT settings (re-runs tools/list).
     /// Run this after restarting the `mcp` server so ChatGPT re-discovers the tools.
     Refresh(RefreshArgs),
-    /// Report what happened to an `ask --request-id` request, from its receipt.
+    /// Report what happened to an `ask/work --request-id` request, from its receipt.
     /// Never touches the browser.
     Status(StatusArgs),
-    /// Pick up an `ask --request-id` request whose caller lost it: wait for its
+    /// Pick up an `ask/work --request-id` request whose caller lost it: wait for its
     /// reply on the server without sending anything. Prints one JSON envelope.
     Resume(ResumeArgs),
-    /// Stop the generation behind an `ask --request-id` request; reports
+    /// Stop the generation behind an `ask/work --request-id` request; reports
     /// `cancelled` only when the conversation record confirms it.
     Cancel(CancelArgs),
 }
 
 #[derive(clap::Args, Debug)]
 pub struct CancelArgs {
-    /// The id given to `ask --request-id`.
+    /// The id given to `ask/work --request-id`.
     pub request_id: String,
     #[command(flatten)]
     pub channel: ChannelArgs,
@@ -58,7 +58,7 @@ pub struct CancelArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct ResumeArgs {
-    /// The id given to `ask --request-id`.
+    /// The id given to `ask/work --request-id`.
     pub request_id: String,
     /// Validate the reply against this JSON Schema, as `ask --output-schema` does.
     #[arg(long = "output-schema", value_name = "FILE")]
@@ -69,7 +69,7 @@ pub struct ResumeArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct StatusArgs {
-    /// The id given to `ask --request-id`.
+    /// The id given to `ask/work --request-id`.
     pub request_id: String,
 }
 
@@ -86,6 +86,9 @@ pub enum BusyPolicy {
 pub struct WorkArgs {
     /// The task for ChatGPT to carry out on the local project via its connector tools.
     pub task: String,
+    /// Caller-chosen id for this one logical work turn.
+    #[arg(long = "request-id", value_name = "ID")]
+    pub request_id: Option<String>,
     /// Append this work turn to an existing ChatGPT conversation instead of creating
     /// a new chat. The conversation is reopened and identity-checked before typing.
     #[arg(
@@ -347,4 +350,43 @@ pub struct HandoffArgs {
     /// Actually launch the executor. Without it, print the assembled command (dry-run).
     #[arg(long)]
     pub execute: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn work_parser_accepts_receipt_conversation_and_model_axes() {
+        let cli = Cli::try_parse_from([
+            "chatgpt-use",
+            "work",
+            "do it",
+            "--request-id",
+            "orch-r1",
+            "--conversation-id",
+            "conv-1",
+            "--session",
+            "orch-web-repo-i1",
+            "--model-family",
+            "GPT-5.6 Sol",
+            "--effort",
+            "high",
+            "--retries",
+            "0",
+        ])
+        .expect("work contract should parse");
+        match cli.command {
+            Command::Work(args) => {
+                assert_eq!(args.request_id.as_deref(), Some("orch-r1"));
+                assert_eq!(args.conversation_id.as_deref(), Some("conv-1"));
+                assert_eq!(args.channel.session.as_deref(), Some("orch-web-repo-i1"));
+                assert_eq!(args.channel.model_family.as_deref(), Some("GPT-5.6 Sol"));
+                assert_eq!(args.channel.effort.as_deref(), Some("high"));
+                assert_eq!(args.retries, 0);
+            }
+            _ => panic!("expected work command"),
+        }
+    }
 }

@@ -23,8 +23,9 @@
 //! build/run. The connector only works on a NON-Pro model, so we default to the
 //! Instant level.
 
-use crate::channel::{Channel, ChannelOptions, SendOptions};
+use crate::channel::{Channel, ChannelError, ChannelOptions, ErrorKind, SendOptions, Submitted};
 use crate::cli::WorkArgs;
+use crate::{receipt, structured};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
@@ -50,14 +51,48 @@ fn sync_mcp_workspace_pointer() -> Result<()> {
 }
 
 pub fn run(args: &WorkArgs) -> Result<()> {
-    sync_mcp_workspace_pointer()?;
-    // The connector requires a non-Pro model; default to Instant unless the
-    // caller explicitly picked a level.
+    if args.request_id.is_some() {
+        crate::channel::install_cancel_handler();
+    }
+    let receipt_path = claim_receipt(args)?;
+
+    let (result, conversation_id) = run_work_turn(args, receipt_path.clone());
+    let mut envelope = match &result {
+        Ok(_) => serde_json::json!({"status": "completed"}),
+        Err(e) => structured::failure(e),
+    };
+    if let Some(id) = &conversation_id {
+        envelope["conversation_id"] = id.as_str().into();
+    }
+    finish_receipt(receipt_path.as_deref(), &envelope);
+
+    let text = result?;
+    crate::ledger::record(
+        "work",
+        serde_json::json!({
+            "task_chars": args.task.len(),
+            "reply_chars": text.len(),
+            "looped": args.r#loop,
+            "request_id": args.request_id,
+        }),
+    );
+    if let Some(id) = conversation_id {
+        eprintln!("CHATGPT_CONVERSATION_ID={id}");
+    }
+    println!("{text}");
+    Ok(())
+}
+
+fn run_work_turn(
+    args: &WorkArgs,
+    receipt_path: Option<PathBuf>,
+) -> (Result<String>, Option<String>) {
+    if let Err(e) = sync_mcp_workspace_pointer() {
+        return (Err(e), None);
+    }
+
     let model = args.channel.requested_model();
-
-    // Building/testing can take minutes; give it plenty of room.
     let timeout_secs = args.channel.timeout.max(1200);
-
     let opts = ChannelOptions {
         profile: args.channel.profile.clone(),
         session: args.channel.session.clone(),
@@ -66,37 +101,72 @@ pub fn run(args: &WorkArgs) -> Result<()> {
         timeout_secs,
         model,
         busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
-        receipt: None,
+        receipt: receipt_path,
     };
 
     let sopts = SendOptions::work();
     let mut channel = match args.conversation_id.as_deref() {
-        Some(id) => Channel::connect_existing(&opts, id)?,
-        None => Channel::connect(&opts)?,
+        Some(id) => match Channel::connect_existing(&opts, id) {
+            Ok(channel) => channel,
+            Err(e) => return (Err(e), None),
+        },
+        None => match Channel::connect(&opts) {
+            Ok(channel) => channel,
+            Err(e) => return (Err(e), None),
+        },
     };
 
-    // Run the dispatch (+ thin-report retries), then optionally keep the loop
-    // going across turns. Capture the exact conversation id before close() so
-    // callers can resume the same implementation thread after an external
-    // review/correction boundary.
     let result = drive(&mut channel, args, &sopts);
     let conversation_id = channel.conversation_id().map(str::to_string);
     channel.close();
-    let text = result?;
+    (result, conversation_id)
+}
 
-    crate::ledger::record(
-        "work",
-        serde_json::json!({
-            "task_chars": args.task.len(),
-            "reply_chars": text.len(),
-            "looped": args.r#loop,
-        }),
-    );
-    if let Some(id) = conversation_id {
-        eprintln!("CHATGPT_CONVERSATION_ID={id}");
+fn claim_receipt(args: &WorkArgs) -> Result<Option<PathBuf>> {
+    let Some(id) = &args.request_id else {
+        return Ok(None);
+    };
+    if !receipt::valid_id(id) {
+        anyhow::bail!(
+            "invalid --request-id {id:?}: use letters, digits, '.', '_' or '-' (up to 128)"
+        );
     }
-    println!("{text}");
-    Ok(())
+    let path = receipt::path_for(id);
+    let fresh = receipt::Receipt::accepted(id);
+    if receipt::create(&path, &fresh)
+        .with_context(|| format!("could not write receipt {}", path.display()))?
+    {
+        return Ok(Some(path));
+    }
+    let existing = receipt::load(&path);
+    if !receipt::may_send(existing.as_ref()) || existing.is_none() {
+        let (state, submitted) = existing
+            .as_ref()
+            .map(|r| (r.state.as_str(), r.submitted.as_str()))
+            .unwrap_or(("unreadable", "unknown"));
+        let prior = if submitted == "yes" {
+            Submitted::Yes
+        } else {
+            Submitted::Unknown
+        };
+        return Err(ChannelError::new(
+            ErrorKind::Duplicate,
+            format!(
+                "request {id:?} already exists (state {state}, submitted {submitted}); not sending it again. Look it up with: chatgpt-use status {id}"
+            ),
+        )
+        .with_submitted(prior)
+        .into());
+    }
+    receipt::save(&path, &fresh)
+        .with_context(|| format!("could not write receipt {}", path.display()))?;
+    Ok(Some(path))
+}
+
+fn finish_receipt(path: Option<&std::path::Path>, envelope: &serde_json::Value) {
+    if let Some(path) = path {
+        receipt::finish(path, envelope);
+    }
 }
 
 /// Send the task, retry on a thin report, then loop "continue" turns if asked.

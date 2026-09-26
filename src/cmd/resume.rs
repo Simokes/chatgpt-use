@@ -1,4 +1,4 @@
-//! `resume <request-id>` — pick up an `ask --request-id` request whose caller
+//! `resume <request-id>` — pick up an `ask/work --request-id` request whose caller
 //! lost it (a timeout, a crash, a kill) by waiting for its reply on the
 //! server. It never sends anything: the whole point of a receipt is that a
 //! lost reply is looked up, not asked for twice.

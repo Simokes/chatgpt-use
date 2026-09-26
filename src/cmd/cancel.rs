@@ -1,4 +1,4 @@
-//! `cancel <request-id>` — stop the generation behind one `ask --request-id`
+//! `cancel <request-id>` — stop the generation behind one `ask/work --request-id`
 //! request, and say whether that is confirmed.
 //!
 //! With its owner alive, the owner does the stopping: it is signalled
