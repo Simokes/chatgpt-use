@@ -706,6 +706,35 @@ const JS_NEW_CHAT_IN_PLACE: &str = r#"(() => {
   return JSON.stringify({ok: true});
 })()"#;
 
+/// JS: is this tab already on chatgpt.com? Used instead of
+/// `JS_NEW_CHAT_IN_PLACE` when the caller is about to reopen an existing
+/// conversation: a throwaway "New chat" first is one more navigation for
+/// nothing.
+const JS_ON_CHATGPT: &str =
+    r#"(() => JSON.stringify({ok: /(^|\.)chatgpt\.com$/.test(location.hostname)}))()"#;
+
+/// Probe used to reuse this session's tab: a fresh chat for a new
+/// conversation, or just "is it ChatGPT" when an existing one is reopened next.
+fn reuse_probe_js(fresh_chat: bool) -> &'static str {
+    if fresh_chat {
+        JS_NEW_CHAT_IN_PLACE
+    } else {
+        JS_ON_CHATGPT
+    }
+}
+
+/// Options for the connect step of `connect_existing`: no project entry (the
+/// conversation owns its membership), no Temporary Chat, and no model — the
+/// model and effort are applied on the reopened conversation's own composer,
+/// not on a page that is left right after.
+fn existing_conversation_connect_options(opts: &ChannelOptions) -> ChannelOptions {
+    let mut plain = opts.clone();
+    plain.project = String::new();
+    plain.temporary = false;
+    plain.model = None;
+    plain
+}
+
 /// JS: switch to an already-open conversation through the SPA's own sidebar
 /// link, rather than navigating.
 ///
@@ -1029,6 +1058,10 @@ impl Channel {
     /// the project if set), and wait for the composer. Errors clearly if no
     /// logged-in browser is available or the account is rate-limited.
     pub fn connect(opts: &ChannelOptions) -> Result<Self> {
+        Self::connect_with(opts, true)
+    }
+
+    fn connect_with(opts: &ChannelOptions, fresh_chat: bool) -> Result<Self> {
         // Take the surface BEFORE touching the browser: opening the tab and
         // entering a project already mutate the shared window.
         let surface = SurfaceLock::acquire(opts.busy_fail)?;
@@ -1076,7 +1109,7 @@ impl Channel {
         // biting this account counts REQUESTS, not messages, so this is the
         // difference between one run and forty-five as far as it is concerned.
         {
-            let probe = ab_eval(&ab, JS_NEW_CHAT_IN_PLACE, &session, 15.0);
+            let probe = ab_eval(&ab, reuse_probe_js(fresh_chat), &session, 15.0);
             let reused = probe
                 .as_ref()
                 .ok()
@@ -1086,7 +1119,11 @@ impl Channel {
             if reused {
                 let settle = Instant::now() + Duration::from_secs(20);
                 if wait_composer(&ab, &session, settle, 20).unwrap_or(false) {
-                    eprintln!("reusing the open ChatGPT tab (new chat, no page reload)");
+                    if fresh_chat {
+                        eprintln!("reusing the open ChatGPT tab (new chat, no page reload)");
+                    } else {
+                        eprintln!("reusing the open ChatGPT tab (no new chat)");
+                    }
                     opened = true;
                 }
             }
@@ -1278,28 +1315,7 @@ impl Channel {
         // caller named a model, so erring here refuses exactly the request we
         // cannot honour.
         if let Some(ref model) = opts.model {
-            let selections: Vec<&str> = if let Some(spec) = model.strip_prefix("__axes__\t") {
-                let mut parts = spec.splitn(2, '\t');
-                let family = parts.next().unwrap_or("");
-                let effort = parts.next().unwrap_or("");
-                [family, effort]
-                    .into_iter()
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            } else {
-                vec![model.as_str()]
-            };
-
-            for selection in selections {
-                let model_deadline = Instant::now() + Duration::from_secs(timeout_secs.min(30));
-                chan.select_model(selection, model_deadline)
-                    .with_context(|| {
-                        format!(
-                            "could not select requested model setting {selection:?} — refusing \
-                         to run with a different ChatGPT model or thinking effort"
-                        )
-                    })?;
-            }
+            chan.apply_requested_model(model, timeout_secs)?;
         }
 
         if opts.temporary {
@@ -1311,6 +1327,35 @@ impl Channel {
         }
 
         Ok(chan)
+    }
+
+    /// Select an explicitly requested model / thinking effort on the current
+    /// composer, refusing (never falling back to the account default) when a
+    /// setting cannot be applied.
+    fn apply_requested_model(&self, model: &str, timeout_secs: u64) -> Result<()> {
+        let selections: Vec<&str> = if let Some(spec) = model.strip_prefix("__axes__\t") {
+            let mut parts = spec.splitn(2, '\t');
+            let family = parts.next().unwrap_or("");
+            let effort = parts.next().unwrap_or("");
+            [family, effort]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            vec![model]
+        };
+
+        for selection in selections {
+            let model_deadline = Instant::now() + Duration::from_secs(timeout_secs.min(30));
+            self.select_model(selection, model_deadline)
+                .with_context(|| {
+                    format!(
+                        "could not select requested model setting {selection:?} — refusing \
+                         to run with a different ChatGPT model or thinking effort"
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     fn temporary_chat_mode(&self, budget: f64) -> Result<Option<bool>> {
@@ -1901,17 +1946,20 @@ impl Channel {
         if opts.temporary {
             bail!("an existing conversation cannot be reopened as Temporary Chat");
         }
-        let mut plain = opts.clone();
-        // Existing conversations already own their project membership.
-        plain.project = String::new();
-        plain.temporary = false;
-        let mut chan = Channel::connect(&plain)?;
+        // Existing conversations already own their project membership, and the
+        // model is chosen on the conversation itself below - not on a new chat
+        // that is left immediately (that preflight cost a navigation per turn).
+        let plain = existing_conversation_connect_options(opts);
+        let mut chan = Channel::connect_with(&plain, false)?;
         chan.project = opts.project.trim().to_string();
         chan.convo_id = Some(convo_id.trim().to_string());
         chan.submitted = false;
         let budget = opts.timeout_secs.min(90).max(20) as f64;
         chan.reopen_pinned(budget)
             .with_context(|| format!("could not reopen conversation {}", convo_id.trim()))?;
+        if let Some(ref model) = opts.model {
+            chan.apply_requested_model(model, opts.timeout_secs)?;
+        }
         Ok(chan)
     }
 
@@ -3891,6 +3939,46 @@ fi
                 .lines()
                 .any(|line| line.starts_with("open https://chatgpt.com/c/")),
             "successful SPA reattach should not hard-navigate: {calls}"
+        );
+    }
+
+    #[test]
+    fn existing_conversation_connect_skips_model_project_and_new_chat() {
+        let opts = ChannelOptions {
+            profile: "relay".to_string(),
+            session: Some("s".to_string()),
+            project: "Orch".to_string(),
+            temporary: false,
+            timeout_secs: 60,
+            model: Some("__axes__\tGPT-5.6 Sol\thigh".to_string()),
+            busy_fail: false,
+            receipt: None,
+        };
+        let plain = existing_conversation_connect_options(&opts);
+        assert!(
+            plain.model.is_none(),
+            "model must be applied after reopening"
+        );
+        assert!(plain.project.is_empty());
+        assert!(!plain.temporary);
+        assert_eq!(opts.model.as_deref(), Some("__axes__\tGPT-5.6 Sol\thigh"));
+        assert!(!reuse_probe_js(false).contains("new chat"));
+        assert!(!reuse_probe_js(false).contains("click"));
+        assert!(reuse_probe_js(true).contains("new chat"));
+    }
+
+    #[test]
+    fn apply_requested_model_selects_family_then_effort_on_the_current_composer() {
+        let (ab, log) = fake_chrome_use("apply-model");
+        let channel = fake_channel(ab, Some("6ab6d791-b9c4-83eb-97c2-95d06acc799f"));
+        channel
+            .apply_requested_model("__axes__\tGPT-5.6 Sol\thigh", 30)
+            .unwrap();
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert!(!calls.contains("new chat"), "{calls}");
+        assert!(
+            !calls.lines().any(|line| line.starts_with("open ")),
+            "model selection must not navigate: {calls}"
         );
     }
 
