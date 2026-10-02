@@ -1591,47 +1591,6 @@ impl Channel {
     /// Replace the live composer content and verify it landed intact. Nothing
     /// here can submit anything, so any error is safe to retry.
     fn fill_composer(&self, message: &str, budget: f64) -> Result<()> {
-        // Clear any restored draft through chrome-use's native editor adapter
-        // before replacing the composer from file. Require the empty state to
-        // remain stable across a short interval: ChatGPT can hydrate an old
-        // draft just after the first clear, which would otherwise be appended
-        // to the review prompt and make chrome-use's own fill verification fail.
-        let mut cleared = false;
-        for _ in 0..5 {
-            let mut clear_target_found = false;
-            for selector in COMPOSER_EDIT_SELECTORS {
-                if ab_cmd(&self.ab, &["fill", selector, ""], &self.session, budget).is_ok() {
-                    clear_target_found = true;
-                    break;
-                }
-            }
-            if !clear_target_found {
-                std::thread::sleep(Duration::from_millis(300));
-                continue;
-            }
-            let empty_now = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget)
-                .ok()
-                .and_then(|v| v.get("n").and_then(|n| n.as_u64()))
-                == Some(0);
-            if empty_now {
-                std::thread::sleep(Duration::from_millis(300));
-                let still_empty = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget)
-                    .ok()
-                    .and_then(|v| v.get("n").and_then(|n| n.as_u64()))
-                    == Some(0);
-                if still_empty {
-                    cleared = true;
-                    break;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(300));
-        }
-        if !cleared {
-            bail!(
-                "could not keep the ChatGPT composer empty long enough to replace a restored draft"
-            );
-        }
-
         let path = std::env::temp_dir().join(format!(
             "chatgpt-use-composer-{}-{}.txt",
             std::process::id(),
@@ -1640,43 +1599,81 @@ impl Channel {
         ));
         std::fs::write(&path, message).context("writing temporary composer payload")?;
         let path_text = path.to_string_lossy().into_owned();
+        let expected = composer_fingerprint(message);
+        let mut last_error: Option<anyhow::Error> = None;
 
-        let mut filled = false;
-        let mut last_fill_error = None;
-        for selector in COMPOSER_EDIT_SELECTORS {
-            match ab_cmd(
+        // A reconnect can land while ChatGPT is swapping editor variants. Keep
+        // clear + replace as one bounded pre-submit transaction: stabilize one
+        // concrete editor, write to that exact editor, and restart the cycle if
+        // hydration replaces it before the write. Nothing here can submit.
+        for _ in 0..3 {
+            let mut stable_selector: Option<&str> = None;
+            for _ in 0..5 {
+                for selector in COMPOSER_EDIT_SELECTORS {
+                    if ab_cmd(&self.ab, &["fill", selector, ""], &self.session, budget).is_err() {
+                        continue;
+                    }
+                    let empty_now =
+                        ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget)
+                            .ok()
+                            .and_then(|v| v.get("n").and_then(|n| n.as_u64()))
+                            == Some(0);
+                    if !empty_now {
+                        continue;
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+                    let still_empty =
+                        ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget)
+                            .ok()
+                            .and_then(|v| v.get("n").and_then(|n| n.as_u64()))
+                            == Some(0);
+                    if still_empty {
+                        stable_selector = Some(*selector);
+                        break;
+                    }
+                }
+                if stable_selector.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+
+            let Some(selector) = stable_selector else {
+                last_error = Some(anyhow!(
+                    "could not keep the ChatGPT composer empty long enough to replace a restored draft"
+                ));
+                continue;
+            };
+
+            if let Err(e) = ab_cmd(
                 &self.ab,
                 &["fill", selector, "--file", &path_text],
                 &self.session,
                 budget,
             ) {
-                Ok(_) => {
-                    filled = true;
-                    break;
-                }
-                Err(e) => last_fill_error = Some(e),
+                last_error = Some(e.context("replacing ChatGPT composer content"));
+                continue;
             }
-        }
-        let _ = std::fs::remove_file(&path);
-        if !filled {
-            return Err(last_fill_error
-                .unwrap_or_else(|| anyhow!("no ChatGPT composer selector was available")))
-            .context("replacing ChatGPT composer content");
+
+            let deadline = Instant::now() + Duration::from_secs_f64(budget.clamp(2.0, 10.0));
+            while Instant::now() < deadline {
+                if let Ok(v) = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget) {
+                    let n = v.get("n").and_then(|x| x.as_u64());
+                    let h = v.get("h").and_then(|x| x.as_u64());
+                    if n == Some(expected.0) && h == Some(expected.1 as u64) {
+                        let _ = std::fs::remove_file(&path);
+                        return Ok(());
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            last_error = Some(anyhow!(
+                "composer content did not match the requested prompt after native fill --file"
+            ));
         }
 
-        let expected = composer_fingerprint(message);
-        let deadline = Instant::now() + Duration::from_secs_f64(budget.clamp(2.0, 10.0));
-        while Instant::now() < deadline {
-            if let Ok(v) = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget) {
-                let n = v.get("n").and_then(|x| x.as_u64());
-                let h = v.get("h").and_then(|x| x.as_u64());
-                if n == Some(expected.0) && h == Some(expected.1 as u64) {
-                    return Ok(());
-                }
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        bail!("composer content did not match the requested prompt after native fill --file")
+        let _ = std::fs::remove_file(&path);
+        Err(last_error.unwrap_or_else(|| anyhow!("could not replace the ChatGPT composer")))
     }
 
     /// Submit once and return only when a new user turn proves it landed.
