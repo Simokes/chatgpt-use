@@ -1583,6 +1583,14 @@ impl Channel {
         baseline_users: u64,
         budget: f64,
     ) -> std::result::Result<(), SubmitFailure> {
+        // ChatGPT currently accepts editor mutations in a background relay tab
+        // but ignores the submit action while the document remains hidden.
+        // Surface the tab before touching the composer so the whole user-like
+        // fill/submit cycle runs against a visible page. Failure here is still
+        // safely before any possible submission.
+        ab_cmd(&self.ab, &["bringToFront"], &self.session, budget)
+            .context("bringing ChatGPT tab to the foreground before submit")
+            .map_err(SubmitFailure::BeforeSubmit)?;
         self.fill_composer(message, budget)
             .map_err(SubmitFailure::BeforeSubmit)?;
         self.submit(baseline_users, budget)
@@ -3548,6 +3556,8 @@ fn native_windows_enter(ab: &PathBuf, session: &str, timeout_secs: f64) -> Resul
         return Ok(false);
     }
 
+    ab_cmd(ab, &["focus", COMPOSER_SELECTOR], session, timeout_secs)
+        .context("focusing the ChatGPT composer before native submit")?;
     ab_cmd(ab, &["bringToFront"], session, timeout_secs)
         .context("bringing the ChatGPT tab to the foreground before native submit")?;
 
