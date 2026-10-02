@@ -1112,6 +1112,9 @@ pub struct Channel {
     receipt: Option<PathBuf>,
     /// This channel was admitted under the Chat-only contract.
     chat_only: bool,
+    /// Model/effort request that must be re-established on the final composer
+    /// after every safe pre-submit reconnect.
+    requested_model: Option<String>,
     /// Exclusive claim on the shared ChatGPT window, released when the channel
     /// is dropped or closed.
     _surface: SurfaceLock,
@@ -1315,6 +1318,7 @@ impl Channel {
             submitted: false,
             receipt: opts.receipt.clone(),
             chat_only: opts.chat_only,
+            requested_model: opts.model.clone(),
             _surface: surface,
         };
 
@@ -1682,7 +1686,7 @@ impl Channel {
                 "the page is stuck mid-generation; reloading the conversation to free the composer"
             );
             if self.convo_id.is_some() {
-                self.reopen_pinned(budget)
+                self.reopen_pinned_for_submit(budget)
                     .context("reloading a page stuck mid-generation")?;
             }
             wait_idle(self, 10);
@@ -1938,6 +1942,50 @@ impl Channel {
             .filter(|s| !s.is_empty())
     }
 
+    fn apply_requested_model_contract(&self) -> Result<()> {
+        if let Some(ref model) = self.requested_model {
+            self.apply_requested_model(model, self.timeout_secs)?;
+        }
+        Ok(())
+    }
+
+    fn verify_pinned_identity(&self, budget: f64) -> Result<()> {
+        let Some(ref pinned) = self.convo_id else {
+            bail!("cannot verify a pinned identity before the conversation id is known");
+        };
+        match convo_drift(pinned, self.current_convo_id(budget).as_deref()) {
+            None => Ok(()),
+            Some(msg) => bail!("{msg}"),
+        }
+    }
+
+    /// Reopen a fresh pre-submit surface and restore every submit guard before
+    /// the caller is allowed to type again.
+    fn reopen_fresh_for_submit(&self, budget: f64) -> Result<()> {
+        self.reopen_fresh(budget)?;
+        if self.chat_only {
+            let deadline = Instant::now() + Duration::from_secs_f64(budget.clamp(2.0, 20.0));
+            self.ensure_chat_only_fresh(deadline)
+                .context("fresh reconnect did not prove Chat-only before retry")?;
+        }
+        self.apply_requested_model_contract()
+            .context("fresh reconnect did not restore the requested effort before retry")
+    }
+
+    /// Reopen the pinned conversation, prove that the final composer belongs
+    /// to that exact id, then restore Chat/effort guards on that composer.
+    fn reopen_pinned_for_submit(&self, budget: f64) -> Result<()> {
+        self.reopen_pinned(budget)?;
+        self.verify_pinned_identity(budget)
+            .context("reopened composer does not belong to the pinned conversation")?;
+        if self.chat_only {
+            let id = self.convo_id.as_deref().expect("pinned id checked above");
+            self.verify_existing_chat_only(id, budget)?;
+        }
+        self.apply_requested_model_contract()
+            .context("pinned reconnect did not restore the requested effort on the final composer")
+    }
+
     /// Fail closed if the tab has drifted off the conversation we pinned.
     ///
     /// A `None` pin means "not latched yet" (fresh chat, first turn) and always
@@ -1954,11 +2002,8 @@ impl Channel {
         // Drifted. Try once to steer back before giving up — a stray navigation
         // or a sidebar click is recoverable, and the conversation itself (with
         // all our accumulated context) is still there on the server.
-        self.reopen_pinned(budget)?;
-        match convo_drift(pinned, self.current_convo_id(budget).as_deref()) {
-            None => Ok(()),
-            Some(msg) => bail!("{msg}"),
-        }
+        self.reopen_pinned_for_submit(budget)?;
+        self.verify_pinned_identity(budget)
     }
 
     /// Re-establish a FRESH chat after losing the tab before anything was said.
@@ -2094,15 +2139,14 @@ impl Channel {
         chan.convo_id = Some(convo_id.trim().to_string());
         chan.submitted = false;
         let budget = opts.timeout_secs.min(90).max(20) as f64;
-        chan.reopen_pinned(budget)
-            .with_context(|| format!("could not reopen conversation {}", convo_id.trim()))?;
         chan.chat_only = opts.chat_only;
-        if opts.chat_only {
-            chan.verify_existing_chat_only(convo_id.trim(), budget)?;
-        }
-        if let Some(ref model) = opts.model {
-            chan.apply_requested_model(model, opts.timeout_secs)?;
-        }
+        chan.requested_model = opts.model.clone();
+        chan.reopen_pinned_for_submit(budget).with_context(|| {
+            format!(
+                "could not reopen conversation {} with its final submit contract",
+                convo_id.trim()
+            )
+        })?;
         Ok(chan)
     }
 
@@ -2340,11 +2384,13 @@ impl Channel {
             // Reconnect: back to our conversation if we have one, otherwise to a
             // fresh chat — nothing has been said yet, so nothing is lost.
             if self.convo_id.is_some() {
-                self.reopen_pinned(remaining_secs())
-                    .context("could not reattach after a failed submit")?;
+                self.reopen_pinned_for_submit(remaining_secs()).context(
+                    "could not reattach with the final submit contract after a failed submit",
+                )?;
             } else {
-                self.reopen_fresh(remaining_secs())
-                    .context("could not reopen ChatGPT after a failed submit")?;
+                self.reopen_fresh_for_submit(remaining_secs()).context(
+                    "could not reopen ChatGPT with the final submit contract after a failed submit",
+                )?;
             }
 
             // Re-baseline against the reattached page, and skip the resend
@@ -3991,10 +4037,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join("chrome-use");
         let log = dir.join("calls.log");
+        let state = dir.join("state");
         let fake_mode = if name.contains("chat-only-work") {
             "work"
         } else if name.contains("chat-only-ambiguous") {
             "ambiguous"
+        } else if name.contains("stale-convo") {
+            "stale-convo"
         } else {
             "chat"
         };
@@ -4002,11 +4051,22 @@ mod tests {
 set -eu
 printf '%s\n' "$*" >> '__LOG__'
 FAKE_MODE='__MODE__'
+STATE='__STATE__'
 cmd="${1-}"
 if [ "$cmd" = "eval" ]; then
   js="${2-}"
   if printf '%s' "$js" | grep -q 'const present ='; then
     printf '%s\n' '"{\"present\":true}"'
+  elif printf '%s' "$js" | grep -q 'location.pathname.match'; then
+    if [ "$FAKE_MODE" = "stale-convo" ]; then
+      if [ -f "$STATE" ]; then
+        printf '%s\n' '"\"6ab6d791-b9c4-83eb-97c2-95d06acc799f\""'
+      else
+        printf '%s\n' '"\"wrong-conversation\""'
+      fi
+    else
+      printf '%s\n' '"\"\""'
+    fi
   elif printf '%s' "$js" | grep -q 'Chat/Work controls not found'; then
     if [ "$FAKE_MODE" = "work" ]; then
       printf '%s\n' '"{\"ok\":true,\"chat\":false,\"work\":true}"'
@@ -4026,6 +4086,7 @@ if [ "$cmd" = "eval" ]; then
   elif printf '%s' "$js" | grep -q 'const menu = document.querySelector'; then
     printf '%s\n' '"{\"open\":true,\"slider\":{\"now\":2,\"min\":0,\"max\":3},\"radios\":[{\"text\":\"GPT-5.6 Sol\",\"checked\":false}],\"level\":\"High\"}"'
   elif printf '%s' "$js" | grep -q 'conversation not in the sidebar'; then
+    if [ "$FAKE_MODE" = "stale-convo" ]; then touch "$STATE"; fi
     printf '%s\n' '"{\"ok\":true}"'
   elif printf '%s' "$js" | grep -q 'limited:'; then
     printf '%s\n' '"{\"limited\":false,\"composer\":true}"'
@@ -4037,7 +4098,8 @@ if [ "$cmd" = "eval" ]; then
 fi
 "#
         .replace("__LOG__", &log.display().to_string())
-        .replace("__MODE__", fake_mode);
+        .replace("__MODE__", fake_mode)
+        .replace("__STATE__", &state.display().to_string());
         std::fs::write(&bin, script).unwrap();
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
         perms.set_mode(0o755);
@@ -4057,6 +4119,7 @@ fi
             submitted: false,
             receipt: None,
             chat_only: false,
+            requested_model: None,
             _surface: SurfaceLock { _file: None },
         }
     }
@@ -4128,6 +4191,81 @@ fi
         assert!(
             calls.contains("role=\\\"slider\\\"") || calls.contains("role=\"slider\""),
             "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn before_submit_fresh_reconnect_refuses_work_before_effort_or_retry_submit() {
+        let (ab, log) = fake_chrome_use("chat-only-work");
+        let mut channel = fake_channel(ab, None);
+        channel.chat_only = true;
+        channel.requested_model = Some("high".to_string());
+
+        let result = channel.reopen_fresh_for_submit(2.0);
+        assert!(
+            result.is_err(),
+            "a fresh reconnect that stays Work must fail closed"
+        );
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert!(calls.contains("Chat/Work controls not found"), "{calls}");
+        assert!(calls.contains("Chat control not found"), "{calls}");
+        assert!(
+            !calls.contains("composer intelligence trigger not found"),
+            "effort must not be touched until Chat is proven: {calls}"
+        );
+        assert!(
+            !calls.lines().any(|line| line.contains("press Enter")),
+            "no retry submit is allowed while Work remains active: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_reconnect_proves_chat_before_reapplying_effort() {
+        let (ab, log) = fake_chrome_use("retry-chat");
+        let mut channel = fake_channel(ab, None);
+        channel.chat_only = true;
+        channel.requested_model = Some("high".to_string());
+
+        channel.reopen_fresh_for_submit(5.0).unwrap();
+        let calls = std::fs::read_to_string(log).unwrap();
+        let chat = calls
+            .find("Chat/Work controls not found")
+            .expect("Chat guard");
+        let effort = calls
+            .find("composer intelligence trigger not found")
+            .expect("effort verification");
+        assert!(
+            chat < effort,
+            "Chat must be proven before effort on retry: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_pinned_reconnect_verifies_target_identity_before_effort() {
+        let target = "6ab6d791-b9c4-83eb-97c2-95d06acc799f";
+        let (ab, log) = fake_chrome_use("stale-convo");
+        let mut channel = fake_channel(ab, Some(target));
+        channel.requested_model = Some("high".to_string());
+
+        channel.verify_convo(20.0).unwrap();
+        let calls = std::fs::read_to_string(log).unwrap();
+        let identity_checks: Vec<usize> = calls
+            .match_indices("location.pathname.match")
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            identity_checks.len() >= 2,
+            "target id must be checked after reopen: {calls}"
+        );
+        let effort = calls
+            .find("composer intelligence trigger not found")
+            .expect("effort verification on final composer");
+        assert!(
+            identity_checks[1] < effort,
+            "target identity must settle before effort is verified: {calls}"
         );
     }
 
