@@ -1584,143 +1584,41 @@ impl Channel {
         self.submit(baseline_users, budget)
     }
 
-    /// Put `message` in the composer and verify it landed intact. Nothing here
-    /// can have submitted anything, so any error is safe to retry.
+    /// Replace the live composer content and verify it landed intact. Nothing
+    /// here can submit anything, so any error is safe to retry.
     fn fill_composer(&self, message: &str, budget: f64) -> Result<()> {
-        // Never type while the PAGE still believes it is generating. ChatGPT
-        // disables submission then, so Enter is silently swallowed and the turn
-        // reports "never submitted".
-        //
-        // This became reachable when replies started coming from the server: the
-        // record says `end_turn` the moment the turn closes, which can be while
-        // the page is still rendering the tail, so we can now return from one
-        // turn and start the next before the composer is willing. Bounded, and
-        // it gives up rather than blocking — a stop button that never clears is
-        // its own problem and the submit check below will report it honestly.
-        let busy = |ch: &Self| {
-            ab_eval(&ch.ab, JS_STATE, &ch.session, budget)
-                .ok()
-                .filter(|v| v.is_object())
-                .map(|v| {
-                    v.get("stop").and_then(|b| b.as_bool()).unwrap_or(false)
-                        || v.get("tool_active")
-                            .and_then(|b| b.as_bool())
-                            .unwrap_or(false)
-                })
-                .unwrap_or(false)
-        };
-        let wait_idle = |ch: &Self, secs: u64| {
-            let until = Instant::now() + Duration::from_secs(secs);
-            while busy(ch) && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        };
+        let path = std::env::temp_dir().join(format!(
+            "chatgpt-use-composer-{}-{}.txt",
+            std::process::id(),
+            self.session
+                .replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+        ));
+        std::fs::write(&path, message).context("writing temporary composer payload")?;
+        let path_text = path.to_string_lossy().into_owned();
 
-        wait_idle(self, 10);
-        if busy(self) {
-            // The page is stuck mid-generation and will not recover on its own.
-            // Seen live on an account whose front end had degraded: after a turn
-            // the stop button stayed present indefinitely — still there 32s
-            // later — so the composer refused every further message while the
-            // server had long since closed the turn. Waiting longer does not
-            // help; reloading the conversation does. This is the same trade the
-            // rest of the channel makes: the record is authoritative, the page
-            // is just a keyboard, and a keyboard that has locked up gets reset.
-            eprintln!(
-                "the page is stuck mid-generation; reloading the conversation to free the composer"
-            );
-            if self.convo_id.is_some() {
-                self.reopen_pinned_for_submit(budget)
-                    .context("reloading a page stuck mid-generation")?;
-            }
-            wait_idle(self, 10);
-        }
-
-        // Focus and empty the composer, then insert the message as TEXT.
-        ab_cmd(
+        let result = ab_cmd(
             &self.ab,
-            &["click", COMPOSER_SELECTOR],
+            &["fill", COMPOSER_SELECTOR, "--file", &path_text],
             &self.session,
             budget,
         )
-        .context("clicking ChatGPT composer")?;
-        // Clear through chrome-use's native editor adapter, then confirm the
-        // logical content is empty. This updates ProseMirror's own state, unlike
-        // a raw execCommand delete that can be overwritten by draft hydration.
-        // The fingerprint ignores whitespace, so the editor's trailing newline
-        // still counts as empty.
-        let mut cleared = false;
-        for _ in 0..5 {
-            let _ = ab_cmd(
-                &self.ab,
-                &["fill", COMPOSER_SELECTOR, ""],
-                &self.session,
-                budget,
-            );
-            if ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget)
-                .ok()
-                .and_then(|v| v.get("n").and_then(|n| n.as_u64()))
-                == Some(0)
-            {
-                cleared = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(300));
-        }
-        if !cleared {
-            bail!(
-                "could not empty the ChatGPT composer — leftover text would be \
-                 prepended to the message"
-            );
-        }
+        .context("replacing ChatGPT composer content");
+        let _ = std::fs::remove_file(&path);
+        result?;
 
-        // Let chrome-use perform the editor-specific write through its native
-        // paste adapter, which targets the live textarea/ProseMirror in one
-        // action. We still verify the exact rendered
-        // fingerprint before Enter, so a truncated/polluted write remains
-        // fail-closed and safe to retry.
-        const FILL_ATTEMPTS: usize = 3;
         let expected = composer_fingerprint(message);
-        let mut inserted = false;
-        let mut last_seen: Option<(u64, u64)> = None;
-
-        for attempt in 1..=FILL_ATTEMPTS {
-            ab_paste(&self.ab, message, &self.session, budget).with_context(|| {
-                format!("pasting into ChatGPT composer on attempt {attempt}/{FILL_ATTEMPTS}")
-            })?;
-
-            for _ in 0..10 {
-                std::thread::sleep(Duration::from_millis(75));
-                if let Ok(v) = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget) {
-                    let n = v.get("n").and_then(|x| x.as_u64());
-                    let h = v.get("h").and_then(|x| x.as_u64());
-                    if let (Some(n), Some(h)) = (n, h) {
-                        last_seen = Some((n, h));
-                        if n == expected.0 && h == expected.1 as u64 {
-                            inserted = true;
-                            break;
-                        }
-                    }
+        let deadline = Instant::now() + Duration::from_secs_f64(budget.clamp(2.0, 10.0));
+        while Instant::now() < deadline {
+            if let Ok(v) = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget) {
+                let n = v.get("n").and_then(|x| x.as_u64());
+                let h = v.get("h").and_then(|x| x.as_u64());
+                if n == Some(expected.0) && h == Some(expected.1 as u64) {
+                    return Ok(());
                 }
             }
-            if inserted {
-                break;
-            }
-            eprintln!(
-                "composer fingerprint mismatch after native fill attempt {attempt}/{FILL_ATTEMPTS}; retrying"
-            );
+            std::thread::sleep(Duration::from_millis(100));
         }
-
-        if !inserted {
-            bail!(
-                "composer content could not be made identical after {FILL_ATTEMPTS} native fill attempts \
-                 (got {last_seen:?}, expected n={} h={:#x}) — refusing to submit a truncated, polluted, or scrambled prompt",
-                expected.0,
-                expected.1
-            );
-        }
-
-        Ok(())
+        bail!("composer content did not match the requested prompt after native fill --file")
     }
 
     /// Submit once and return only when a new user turn proves it landed.
@@ -3489,26 +3387,6 @@ fn which_bin(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Paste text through chrome-use's native editor adapter. The combined
-/// selector is resolved once, at the moment of the action, so a hydration swap
-/// between ChatGPT's textarea and ProseMirror variants does not create a
-/// wait-then-fill race.
-fn ab_paste(ab: &PathBuf, text: &str, session: &str, timeout_secs: f64) -> Result<String> {
-    ab_cmd(
-        ab,
-        &[
-            "paste",
-            text,
-            "--format",
-            "text",
-            "--selector",
-            COMPOSER_SELECTOR,
-        ],
-        session,
-        timeout_secs,
-    )
-}
-
 /// Run a chrome-use subcommand with optional profile; return stdout.
 /// Mirrors `_ab` in chatgpt-imagegen: `--profile <p>` precedes the subcommand;
 /// `--session <s>` trails everything.
@@ -3791,34 +3669,6 @@ mod tests {
         assert_eq!(composer_fingerprint("a\u{00a0}b"), plain); // NBSP
         assert_eq!(composer_fingerprint("a\u{0085}b"), plain); // NEL — Rust-only in std
         assert_eq!(composer_fingerprint("a\u{feff}b"), plain); // BOM — JS-only in \s
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn native_paste_passes_long_multiline_prompt_as_one_argument() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("cgu-paste-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let bin = dir.join("chrome-use");
-        let captured = dir.join("prompt.txt");
-        let args_path = dir.join("args.txt");
-        let script = format!(
-            "#!/bin/sh\nset -eu\nprintf '%s' \"${{2-}}\" > '{captured}'\nprintf '%s\n' \"$1 $3 $4 $5 $6\" > '{args}'\nprintf '%s\n' ok\n",
-            captured = captured.display(),
-            args = args_path.display(),
-        );
-        std::fs::write(&bin, script).unwrap();
-        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&bin, perms).unwrap();
-
-        let prompt = format!("{}\n中文😀\n{}", "A".repeat(5000), "Z".repeat(4000));
-        ab_paste(&bin, &prompt, "unit-browser", 5.0).unwrap();
-        assert_eq!(std::fs::read_to_string(&captured).unwrap(), prompt);
-        let args = std::fs::read_to_string(&args_path).unwrap();
-        assert!(args.contains("paste --format text --selector"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The reason the hash exists at all: chrome-use#301 scrambles chunked
