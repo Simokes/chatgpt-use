@@ -3746,6 +3746,8 @@ fn detect_logged_in_profiles() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static FAKE_BROWSER_SEQ: AtomicU64 = AtomicU64::new(1);
     /// One test, not two: both halves have to move HOME, and cargo runs tests
     /// in parallel — as two tests they raced and the second read the first's
     /// directory.
@@ -3961,8 +3963,9 @@ mod tests {
     #[cfg(unix)]
     fn fake_chrome_use(name: &str) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
+        let seq = FAKE_BROWSER_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "chatgpt-use-browser-smoke-{}-{name}",
+            "chatgpt-use-browser-smoke-{}-{seq}-{name}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
