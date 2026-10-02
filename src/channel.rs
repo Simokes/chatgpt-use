@@ -34,6 +34,10 @@ const AB_BIN_CANDIDATES: &[&str] = &[
 const WEB_NEW_CHAT_URL: &str = "https://chatgpt.com/";
 const COMPOSER_SELECTOR: &str =
     r#"#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]"#;
+const COMPOSER_EDIT_SELECTORS: &[&str] = &[
+    r#"div.ProseMirror[contenteditable="true"][role="textbox"]"#,
+    "#prompt-textarea",
+];
 /// One shared chrome-use session name — deliberately NOT per-process.
 ///
 /// A different session name is a different tab, so the old `chatgpt-use-<pid>`
@@ -1594,12 +1598,17 @@ impl Channel {
         // to the review prompt and make chrome-use's own fill verification fail.
         let mut cleared = false;
         for _ in 0..5 {
-            let _ = ab_cmd(
-                &self.ab,
-                &["fill", COMPOSER_SELECTOR, ""],
-                &self.session,
-                budget,
-            );
+            let mut clear_target_found = false;
+            for selector in COMPOSER_EDIT_SELECTORS {
+                if ab_cmd(&self.ab, &["fill", selector, ""], &self.session, budget).is_ok() {
+                    clear_target_found = true;
+                    break;
+                }
+            }
+            if !clear_target_found {
+                std::thread::sleep(Duration::from_millis(300));
+                continue;
+            }
             let empty_now = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget)
                 .ok()
                 .and_then(|v| v.get("n").and_then(|n| n.as_u64()))
@@ -1632,15 +1641,28 @@ impl Channel {
         std::fs::write(&path, message).context("writing temporary composer payload")?;
         let path_text = path.to_string_lossy().into_owned();
 
-        let result = ab_cmd(
-            &self.ab,
-            &["fill", COMPOSER_SELECTOR, "--file", &path_text],
-            &self.session,
-            budget,
-        )
-        .context("replacing ChatGPT composer content");
+        let mut filled = false;
+        let mut last_fill_error = None;
+        for selector in COMPOSER_EDIT_SELECTORS {
+            match ab_cmd(
+                &self.ab,
+                &["fill", selector, "--file", &path_text],
+                &self.session,
+                budget,
+            ) {
+                Ok(_) => {
+                    filled = true;
+                    break;
+                }
+                Err(e) => last_fill_error = Some(e),
+            }
+        }
         let _ = std::fs::remove_file(&path);
-        result?;
+        if !filled {
+            return Err(last_fill_error
+                .unwrap_or_else(|| anyhow!("no ChatGPT composer selector was available")))
+            .context("replacing ChatGPT composer content");
+        }
 
         let expected = composer_fingerprint(message);
         let deadline = Instant::now() + Duration::from_secs_f64(budget.clamp(2.0, 10.0));
