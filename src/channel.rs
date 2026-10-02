@@ -34,10 +34,6 @@ const AB_BIN_CANDIDATES: &[&str] = &[
 const WEB_NEW_CHAT_URL: &str = "https://chatgpt.com/";
 const COMPOSER_SELECTOR: &str =
     r#"#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]"#;
-const COMPOSER_FILL_SELECTORS: &[&str] = &[
-    r#"div.ProseMirror[contenteditable="true"][role="textbox"]"#,
-    "#prompt-textarea",
-];
 /// One shared chrome-use session name — deliberately NOT per-process.
 ///
 /// A different session name is a different tab, so the old `chatgpt-use-<pid>`
@@ -1701,8 +1697,8 @@ impl Channel {
         let mut last_seen: Option<(u64, u64)> = None;
 
         for attempt in 1..=FILL_ATTEMPTS {
-            ab_fill_file(&self.ab, message, &self.session, budget).with_context(|| {
-                format!("filling ChatGPT composer on attempt {attempt}/{FILL_ATTEMPTS}")
+            ab_paste(&self.ab, message, &self.session, budget).with_context(|| {
+                format!("pasting into ChatGPT composer on attempt {attempt}/{FILL_ATTEMPTS}")
             })?;
 
             for _ in 0..10 {
@@ -3529,32 +3525,24 @@ fn which_bin(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Fill the live ChatGPT composer through chrome-use's native editor adapter.
-/// Long prompts travel through a short-lived file because `fill --stdin` has
-/// been observed to stall on ChatGPT's current ProseMirror, while `fill --file`
-/// completes and preserves multiline/unicode content.
-fn ab_fill_file(ab: &PathBuf, text: &str, session: &str, timeout_secs: f64) -> Result<String> {
-    let path =
-        std::env::temp_dir().join(format!("chatgpt-use-composer-{}.txt", std::process::id()));
-    std::fs::write(&path, text).context("writing temporary composer payload")?;
-    let path_text = path.to_string_lossy().into_owned();
-    let mut last_error = None;
-    for selector in COMPOSER_FILL_SELECTORS {
-        match ab_cmd(
-            ab,
-            &["fill", selector, "--file", &path_text],
-            session,
-            timeout_secs,
-        ) {
-            Ok(out) => {
-                let _ = std::fs::remove_file(&path);
-                return Ok(out);
-            }
-            Err(e) => last_error = Some(e),
-        }
-    }
-    let _ = std::fs::remove_file(&path);
-    Err(last_error.unwrap_or_else(|| anyhow!("no ChatGPT composer selector was available")))
+/// Paste text through chrome-use's native editor adapter. The combined
+/// selector is resolved once, at the moment of the action, so a hydration swap
+/// between ChatGPT's textarea and ProseMirror variants does not create a
+/// wait-then-fill race.
+fn ab_paste(ab: &PathBuf, text: &str, session: &str, timeout_secs: f64) -> Result<String> {
+    ab_cmd(
+        ab,
+        &[
+            "paste",
+            text,
+            "--format",
+            "text",
+            "--selector",
+            COMPOSER_SELECTOR,
+        ],
+        session,
+        timeout_secs,
+    )
 }
 
 /// Run a chrome-use subcommand with optional profile; return stdout.
@@ -3843,19 +3831,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_fill_uses_short_lived_file_for_long_multiline_prompt() {
+    fn native_paste_passes_long_multiline_prompt_as_one_argument() {
         use std::os::unix::fs::PermissionsExt;
-        let dir =
-            std::env::temp_dir().join(format!("cgu-fill-file-{}-native-fill", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cgu-paste-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join("chrome-use");
-        let captured = dir.join("captured.txt");
+        let captured = dir.join("prompt.txt");
         let args_path = dir.join("args.txt");
         let script = format!(
-            "#!/bin/sh\nset -eu\nprintf '%s\n' \"$*\" > '{args}'\nfile=''\nprev=''\nfor x in \"$@\"; do if [ \"$prev\" = '--file' ]; then file=\"$x\"; fi; prev=\"$x\"; done\ncat \"$file\" > '{captured}'\nprintf '%s\n' 'ok'\n",
-            args = args_path.display(),
+            "#!/bin/sh\nset -eu\nprintf '%s' \"${{2-}}\" > '{captured}'\nprintf '%s\n' \"$1 $3 $4 $5 $6\" > '{args}'\nprintf '%s\n' ok\n",
             captured = captured.display(),
+            args = args_path.display(),
         );
         std::fs::write(&bin, script).unwrap();
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
@@ -3863,12 +3850,10 @@ mod tests {
         std::fs::set_permissions(&bin, perms).unwrap();
 
         let prompt = format!("{}\n中文😀\n{}", "A".repeat(5000), "Z".repeat(4000));
-        ab_fill_file(&bin, &prompt, "unit-browser", 5.0).unwrap();
+        ab_paste(&bin, &prompt, "unit-browser", 5.0).unwrap();
         assert_eq!(std::fs::read_to_string(&captured).unwrap(), prompt);
         let args = std::fs::read_to_string(&args_path).unwrap();
-        assert!(args.contains("fill"));
-        assert!(args.contains("--file"));
-        assert!(args.contains("--session unit-browser"));
+        assert!(args.contains("paste --format text --selector"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
