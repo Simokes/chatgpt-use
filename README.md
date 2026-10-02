@@ -443,7 +443,7 @@ chatgpt-use work "<task>"
 chatgpt-use refresh [--connector chatgpt-use] [--url <settings-url>]
 
 # Sidekick — plain question (harness is the brain)
-chatgpt-use ask "<question>" [--file <path> ...] [--profile auto|relay|"Profile N"]
+chatgpt-use ask "<question>" [--file <path> ...] [--profile auto|relay|"Profile N"] [--chat-only]
 
 # Structured delegation — ChatGPT plans/reviews, returns a verdict packet
 chatgpt-use ask "<task>" --mode plan|review|debug|research --file <ctx> [--json] [--model pro]

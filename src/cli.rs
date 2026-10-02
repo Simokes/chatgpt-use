@@ -235,6 +235,9 @@ pub struct AskArgs {
         conflicts_with = "temporary"
     )]
     pub conversation_id: Option<String>,
+    /// Require the Chat surface (never Work) before this ask prompt is submitted.
+    #[arg(long = "chat-only")]
+    pub chat_only: bool,
     #[command(flatten)]
     pub channel: ChannelArgs,
 }
@@ -361,6 +364,20 @@ pub struct HandoffArgs {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn ask_parser_accepts_chat_only_effort_contract() {
+        let cli = Cli::try_parse_from([
+            "chatgpt-use", "ask", "review it", "--chat-only", "--effort", "high",
+        ]).expect("ask chat-only contract should parse");
+        match cli.command {
+            Command::Ask(args) => {
+                assert!(args.chat_only);
+                assert_eq!(args.channel.effort.as_deref(), Some("high"));
+            }
+            _ => panic!("expected ask command"),
+        }
+    }
 
     #[test]
     fn work_parser_accepts_receipt_conversation_and_model_axes() {
