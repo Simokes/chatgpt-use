@@ -17,7 +17,6 @@
 //! Owned by the CORE agent.
 
 use anyhow::{anyhow, bail, Context, Result};
-use base64::Engine;
 use std::fs::File;
 use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
@@ -35,6 +34,10 @@ const AB_BIN_CANDIDATES: &[&str] = &[
 const WEB_NEW_CHAT_URL: &str = "https://chatgpt.com/";
 const COMPOSER_SELECTOR: &str =
     r#"#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]"#;
+const COMPOSER_FILL_SELECTORS: &[&str] = &[
+    r#"div.ProseMirror[contenteditable="true"][role="textbox"]"#,
+    "#prompt-textarea",
+];
 /// One shared chrome-use session name — deliberately NOT per-process.
 ///
 /// A different session name is a different tab, so the old `chatgpt-use-<pid>`
@@ -467,46 +470,6 @@ const JS_COMPOSER_FINGERPRINT: &str = r#"(() => {
     h = Math.imul(h, 0x01000193) >>> 0;
   }
   return JSON.stringify({n: n, h: h});
-})()"#;
-
-/// Stage UTF-8 bytes in small browser-eval payloads, then commit the whole prompt to
-/// ProseMirror in ONE `insertText` transaction. Multiple successive insertText calls can
-/// be acknowledged and still lose/reorder chunks while ProseMirror reconciles them.
-const JS_RESET_COMPOSER_BUFFER: &str = r#"(() => {
-  window.__cguComposerB64 = [];
-  return JSON.stringify({ok: true});
-})()"#;
-
-fn js_stage_composer_bytes(bytes: &[u8]) -> String {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    format!(
-        r#"(() => {{
-  if (!Array.isArray(window.__cguComposerB64)) window.__cguComposerB64 = [];
-  window.__cguComposerB64.push('{encoded}');
-  return JSON.stringify({{ok: true, parts: window.__cguComposerB64.length}});
-}})()"#
-    )
-}
-
-const JS_COMMIT_COMPOSER_BUFFER: &str = r#"(() => {
-  const c = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]');
-  if (!c) return JSON.stringify({ok: false, error: 'composer not found'});
-  const parts = Array.isArray(window.__cguComposerB64) ? window.__cguComposerB64 : [];
-  try {
-    const chunks = parts.map(p => Uint8Array.from(atob(p), ch => ch.charCodeAt(0)));
-    const total = chunks.reduce((n, b) => n + b.length, 0);
-    const bytes = new Uint8Array(total);
-    let off = 0;
-    for (const chunk of chunks) { bytes.set(chunk, off); off += chunk.length; }
-    const text = new TextDecoder('utf-8', {fatal: true}).decode(bytes);
-    c.focus();
-    const ok = document.execCommand('insertText', false, text);
-    delete window.__cguComposerB64;
-    return JSON.stringify({ok, bytes: total, chars: text.length});
-  } catch (e) {
-    delete window.__cguComposerB64;
-    return JSON.stringify({ok: false, error: String(e)});
-  }
 })()"#;
 
 /// A JS prelude every backend call shares: fetch the page's bearer token ONCE
@@ -1726,72 +1689,22 @@ impl Channel {
             );
         }
 
-        // Transport the prompt to the page in bounded base64 chunks, but mutate
-        // ProseMirror only ONCE. The old design called execCommand once per chunk; on
-        // 2026-09-15 a 15k coordinator prompt repeatedly lost thousands of characters
-        // even though every execCommand returned success. One final transaction avoids
-        // that reconciliation race while keeping each browser-eval payload small.
-        const STAGE_CHUNK_BYTES: usize = 1_000;
-        const INSERT_ATTEMPTS: usize = 3;
+        // Let chrome-use perform the editor-specific write. Its native `fill`
+        // command handles ProseMirror/contenteditable and accepts stdin for long
+        // prompts, which is both simpler and less fragile than maintaining our
+        // own execCommand transaction. We still verify the exact rendered
+        // fingerprint before Enter, so a truncated/polluted write remains
+        // fail-closed and safe to retry.
+        const FILL_ATTEMPTS: usize = 3;
         let expected = composer_fingerprint(message);
         let mut inserted = false;
         let mut last_seen: Option<(u64, u64)> = None;
 
-        for attempt in 1..=INSERT_ATTEMPTS {
-            if attempt > 1 {
-                let mut empty = false;
-                for _ in 0..5 {
-                    let _ = ab_eval(&self.ab, JS_CLEAR_COMPOSER, &self.session, budget);
-                    if ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget)
-                        .ok()
-                        .and_then(|v| v.get("n").and_then(|n| n.as_u64()))
-                        == Some(0)
-                    {
-                        empty = true;
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-                if !empty {
-                    bail!("could not reset the ChatGPT composer before insertion retry");
-                }
-            }
+        for attempt in 1..=FILL_ATTEMPTS {
+            ab_fill_file(&self.ab, message, &self.session, budget).with_context(|| {
+                format!("filling ChatGPT composer on attempt {attempt}/{FILL_ATTEMPTS}")
+            })?;
 
-            let reset = ab_eval(&self.ab, JS_RESET_COMPOSER_BUFFER, &self.session, budget)
-                .context("resetting staged composer buffer")?;
-            if !reset.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                bail!("could not reset staged composer buffer");
-            }
-
-            let mut staged_ok = true;
-            for chunk in message.as_bytes().chunks(STAGE_CHUNK_BYTES) {
-                let res = ab_eval(
-                    &self.ab,
-                    &js_stage_composer_bytes(chunk),
-                    &self.session,
-                    budget,
-                )
-                .context("staging message bytes for composer")?;
-                if !res.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    staged_ok = false;
-                    break;
-                }
-            }
-            if !staged_ok {
-                continue;
-            }
-
-            let commit = ab_eval(&self.ab, JS_COMMIT_COMPOSER_BUFFER, &self.session, budget)
-                .context("committing staged message to composer")?;
-            if !commit.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                eprintln!(
-                    "composer commit failed on insertion attempt {attempt}/{INSERT_ATTEMPTS}"
-                );
-                continue;
-            }
-
-            // React may paint the content shortly after execCommand returns. Require the
-            // exact full fingerprint before Enter; never accept a merely non-empty box.
             for _ in 0..10 {
                 std::thread::sleep(Duration::from_millis(75));
                 if let Ok(v) = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget) {
@@ -1810,13 +1723,13 @@ impl Channel {
                 break;
             }
             eprintln!(
-                "composer fingerprint mismatch after single-transaction insertion attempt {attempt}/{INSERT_ATTEMPTS}; retrying"
+                "composer fingerprint mismatch after native fill attempt {attempt}/{FILL_ATTEMPTS}; retrying"
             );
         }
 
         if !inserted {
             bail!(
-                "composer content could not be made identical after {INSERT_ATTEMPTS} single-transaction attempts \
+                "composer content could not be made identical after {FILL_ATTEMPTS} native fill attempts \
                  (got {last_seen:?}, expected n={} h={:#x}) — refusing to submit a truncated, polluted, or scrambled prompt",
                 expected.0,
                 expected.1
@@ -3616,6 +3529,34 @@ fn which_bin(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Fill the live ChatGPT composer through chrome-use's native editor adapter.
+/// Long prompts travel through a short-lived file because `fill --stdin` has
+/// been observed to stall on ChatGPT's current ProseMirror, while `fill --file`
+/// completes and preserves multiline/unicode content.
+fn ab_fill_file(ab: &PathBuf, text: &str, session: &str, timeout_secs: f64) -> Result<String> {
+    let path =
+        std::env::temp_dir().join(format!("chatgpt-use-composer-{}.txt", std::process::id()));
+    std::fs::write(&path, text).context("writing temporary composer payload")?;
+    let path_text = path.to_string_lossy().into_owned();
+    let mut last_error = None;
+    for selector in COMPOSER_FILL_SELECTORS {
+        match ab_cmd(
+            ab,
+            &["fill", selector, "--file", &path_text],
+            session,
+            timeout_secs,
+        ) {
+            Ok(out) => {
+                let _ = std::fs::remove_file(&path);
+                return Ok(out);
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    Err(last_error.unwrap_or_else(|| anyhow!("no ChatGPT composer selector was available")))
+}
+
 /// Run a chrome-use subcommand with optional profile; return stdout.
 /// Mirrors `_ab` in chatgpt-imagegen: `--profile <p>` precedes the subcommand;
 /// `--session <s>` trails everything.
@@ -3898,44 +3839,35 @@ mod tests {
         assert_eq!(composer_fingerprint("a\u{feff}b"), plain); // BOM — JS-only in \s
     }
 
+    #[cfg(unix)]
     #[test]
-    fn js_stage_composer_bytes_does_not_embed_raw_prompt_content() {
-        let prompt = "`ready` $(echo pwned) \"quoted\" é 中文";
-        let js = js_stage_composer_bytes(prompt.as_bytes());
-        let encoded = base64::engine::general_purpose::STANDARD.encode(prompt.as_bytes());
-        assert!(js.contains(&encoded));
-        assert!(!js.contains(prompt));
-        assert!(!js.contains("$(echo pwned)"));
-    }
+    fn native_fill_uses_short_lived_file_for_long_multiline_prompt() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("cgu-fill-file-{}-native-fill", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("chrome-use");
+        let captured = dir.join("captured.txt");
+        let args_path = dir.join("args.txt");
+        let script = format!(
+            "#!/bin/sh\nset -eu\nprintf '%s\n' \"$*\" > '{args}'\nfile=''\nprev=''\nfor x in \"$@\"; do if [ \"$prev\" = '--file' ]; then file=\"$x\"; fi; prev=\"$x\"; done\ncat \"$file\" > '{captured}'\nprintf '%s\n' 'ok'\n",
+            args = args_path.display(),
+            captured = captured.display(),
+        );
+        std::fs::write(&bin, script).unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
 
-    #[test]
-    fn staged_byte_chunks_round_trip_long_unicode_prompt() {
-        let prompt = format!(
-            "{}\n{}\n{}",
-            "A".repeat(7_777),
-            "中文😀".repeat(900),
-            "Z".repeat(6_321)
-        );
-        let encoded: Vec<String> = prompt
-            .as_bytes()
-            .chunks(1_000)
-            .map(|b| base64::engine::general_purpose::STANDARD.encode(b))
-            .collect();
-        let mut bytes = Vec::new();
-        for part in encoded {
-            bytes.extend(
-                base64::engine::general_purpose::STANDARD
-                    .decode(part)
-                    .unwrap(),
-            );
-        }
-        assert_eq!(String::from_utf8(bytes).unwrap(), prompt);
-        assert_eq!(
-            JS_COMMIT_COMPOSER_BUFFER
-                .matches("execCommand('insertText'")
-                .count(),
-            1
-        );
+        let prompt = format!("{}\n中文😀\n{}", "A".repeat(5000), "Z".repeat(4000));
+        ab_fill_file(&bin, &prompt, "unit-browser", 5.0).unwrap();
+        assert_eq!(std::fs::read_to_string(&captured).unwrap(), prompt);
+        let args = std::fs::read_to_string(&args_path).unwrap();
+        assert!(args.contains("fill"));
+        assert!(args.contains("--file"));
+        assert!(args.contains("--session unit-browser"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The reason the hash exists at all: chrome-use#301 scrambles chunked
@@ -4368,12 +4300,7 @@ fi
         assert!(JS_STATE.contains(r#"[data-content-search-unit-key$=":user"]"#));
         assert!(JS_STATE.contains(r#"[data-content-search-unit-key$=":assistant"]"#));
         assert!(JS_LAST_ASSISTANT.contains(r#"[data-markdown-text-style="assistant-message"]"#));
-        for js in [
-            JS_COMPOSER,
-            JS_CLEAR_COMPOSER,
-            JS_COMPOSER_FINGERPRINT,
-            JS_COMMIT_COMPOSER_BUFFER,
-        ] {
+        for js in [JS_COMPOSER, JS_CLEAR_COMPOSER, JS_COMPOSER_FINGERPRINT] {
             assert!(js.contains("#prompt-textarea"), "{js}");
             assert!(
                 js.contains(r#"div.ProseMirror[contenteditable="true"][role="textbox"]"#),
