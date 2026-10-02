@@ -436,6 +436,8 @@ chatgpt-use work "<task>"
 #                  send "continue" until DONE — lets ONE task span many tool steps
 #   --max-turns N  cap on loop turns (default 8)
 #   --timeout S    per-turn wall-clock; work waits ≥1200s so a build/test can finish
+#   --chat-only    fail closed unless the surface is Chat (never Work); existing conversations
+#                  require a persisted Chat-only attestation or a live DOM proof
 
 # Re-sync the connector after restarting the mcp server (re-runs tools/list).
 chatgpt-use refresh [--connector chatgpt-use] [--url <settings-url>]
@@ -477,6 +479,7 @@ chatgpt-use serve --port 8787   # then: ANTHROPIC_BASE_URL=http://127.0.0.1:8787
 
 # shared channel flags
 #   --model     instant | medium | high | "extra high" | pro   (Pro is browser-only)
+#   --effort    set only the thinking-effort axis (for Orch: high)
 #   --profile   auto (default) | relay | "Profile 3"
 #   --session   reuse a chrome-use tab group   --project  file under a ChatGPT Project
 ```
@@ -568,6 +571,12 @@ Two requirements:
 `--skills-dir <dir>` points discovery at a different root; `--skills-dir ""` disables it. Note: skills
 written purely for the Claude Code harness (those that say "use the Read/Edit tool") won't translate —
 but anything CLI-backed runs fine through `bash`.
+
+### Chat-only work contract
+
+`work --chat-only` is the fail-closed automation mode used by Orch. Before the first submit it reads the Chat/Work toggle through its `aria-pressed` state, switches Work to Chat when possible, and verifies the result. An absent or ambiguous toggle blocks before typing. After the first successful Chat-only submit, the conversation id receives a local attestation under `~/.chatgpt-use/chat-only/`; continuations reopen that conversation directly and require the attestation (or an explicit live DOM proof) instead of silently treating a legacy conversation as Chat.
+
+Model family and thinking effort remain separate options. Orch uses `--chat-only --effort high` and does not request a model family on the current Chat surface. The effort path first reads `data-selected-reasoning-effort`; if it is already `high`, no picker click is performed.
 
 ### Working long enough · loops · scheduled runs
 
