@@ -34,6 +34,7 @@ pub fn run(args: &RefreshArgs) -> Result<()> {
         temporary: false,
         timeout_secs: args.channel.timeout.max(60),
         model: None,
+        chat_only: false,
         busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
         receipt: None,
     };

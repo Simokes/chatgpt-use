@@ -101,6 +101,11 @@ pub struct WorkArgs {
     /// hedging report), re-nudge it this many extra times in the same conversation.
     #[arg(long, default_value_t = 1)]
     pub retries: u32,
+    /// Require the Chat surface (never Work) before any work prompt is submitted.
+    /// Existing conversations must carry a prior local Chat-only attestation or
+    /// expose a DOM state that proves they are Chat.
+    #[arg(long = "chat-only")]
+    pub chat_only: bool,
     /// Keep the task going across turns: ChatGPT ends each report with
     /// `STATUS: DONE` or `STATUS: CONTINUE`, and we auto-send "continue" until it
     /// says DONE or `--max-turns` is hit. Lets one task span many tool steps.
@@ -367,6 +372,7 @@ mod tests {
             "orch-r1",
             "--conversation-id",
             "conv-1",
+            "--chat-only",
             "--session",
             "orch-web-repo-i1",
             "--model-family",
@@ -381,6 +387,7 @@ mod tests {
             Command::Work(args) => {
                 assert_eq!(args.request_id.as_deref(), Some("orch-r1"));
                 assert_eq!(args.conversation_id.as_deref(), Some("conv-1"));
+                assert!(args.chat_only);
                 assert_eq!(args.channel.session.as_deref(), Some("orch-web-repo-i1"));
                 assert_eq!(args.channel.model_family.as_deref(), Some("GPT-5.6 Sol"));
                 assert_eq!(args.channel.effort.as_deref(), Some("high"));

@@ -100,6 +100,7 @@ fn run_work_turn(
         temporary: false,
         timeout_secs,
         model,
+        chat_only: args.chat_only,
         busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
         receipt: receipt_path,
     };

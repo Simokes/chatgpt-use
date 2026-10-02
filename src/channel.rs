@@ -20,7 +20,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
 use std::fs::File;
 use std::io::{Seek, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -713,6 +713,66 @@ const JS_NEW_CHAT_IN_PLACE: &str = r#"(() => {
 const JS_ON_CHATGPT: &str =
     r#"(() => JSON.stringify({ok: /(^|\.)chatgpt\.com$/.test(location.hostname)}))()"#;
 
+/// Read the mutually-exclusive Chat / Work creation-surface buttons. The
+/// control is intentionally located by its pressed-state contract, not by a
+/// page-global coordinate. Labels are used only to distinguish the two peers.
+const JS_CHAT_WORK_MODE: &str = r#"(() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const nodes = [...document.querySelectorAll('button[aria-pressed], [role="button"][aria-pressed]')];
+  const label = el => norm(el.getAttribute('aria-label') || el.textContent || '');
+  const chat = nodes.find(el => label(el) === 'chat');
+  const work = nodes.find(el => ['work', 'travail'].includes(label(el)));
+  if (!chat || !work) return JSON.stringify({ok:false, error:'Chat/Work controls not found'});
+  const cp = chat.getAttribute('aria-pressed');
+  const wp = work.getAttribute('aria-pressed');
+  if (!['true','false'].includes(cp) || !['true','false'].includes(wp)) {
+    return JSON.stringify({ok:false, error:'Chat/Work pressed state is invalid'});
+  }
+  return JSON.stringify({ok:true, chat:cp === 'true', work:wp === 'true'});
+})()"#;
+
+const JS_CLICK_CHAT_MODE: &str = r#"(() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const nodes = [...document.querySelectorAll('button[aria-pressed], [role="button"][aria-pressed]')];
+  const chat = nodes.find(el => norm(el.getAttribute('aria-label') || el.textContent || '') === 'chat');
+  if (!chat) return JSON.stringify({ok:false, error:'Chat control not found'});
+  chat.click();
+  return JSON.stringify({ok:true});
+})()"#;
+
+fn chat_only_marker_path_in(root: &Path, convo_id: &str) -> Option<PathBuf> {
+    if convo_id.is_empty()
+        || !convo_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    {
+        return None;
+    }
+    Some(root.join("chat-only").join(convo_id))
+}
+
+fn chat_only_marker_path(convo_id: &str) -> Option<PathBuf> {
+    chat_only_marker_path_in(&crate::ledger::ledger_dir(), convo_id)
+}
+
+fn chat_only_conversation_proven(convo_id: &str) -> bool {
+    chat_only_marker_path(convo_id).is_some_and(|p| p.is_file())
+}
+
+fn mark_chat_only_conversation_at(root: &Path, convo_id: &str) -> std::io::Result<()> {
+    let path = chat_only_marker_path_in(root, convo_id).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid conversation id")
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, b"chat-only-v1\n")
+}
+
+fn mark_chat_only_conversation(convo_id: &str) -> std::io::Result<()> {
+    mark_chat_only_conversation_at(&crate::ledger::ledger_dir(), convo_id)
+}
+
 /// Probe used to reuse this session's tab: a fresh chat for a new
 /// conversation, or just "is it ChatGPT" when an existing one is reopened next.
 fn reuse_probe_js(fresh_chat: bool) -> &'static str {
@@ -732,6 +792,7 @@ fn existing_conversation_connect_options(opts: &ChannelOptions) -> ChannelOption
     plain.project = String::new();
     plain.temporary = false;
     plain.model = None;
+    plain.chat_only = false;
     plain
 }
 
@@ -972,9 +1033,10 @@ pub struct ChannelOptions {
     pub temporary: bool,
     /// Per-turn wall-clock budget in seconds.
     pub timeout_secs: u64,
-    /// Browser-channel model to select: pro | thinking | instant | <raw label>.
-    /// None → use the account default. (Pro is reachable only via the browser.)
+    /// Browser-channel model/effort selection. None → use the account default.
     pub model: Option<String>,
+    /// Refuse to submit unless the conversation is proven to use Chat, never Work.
+    pub chat_only: bool,
     /// Fail with `ErrorKind::Busy` instead of queueing behind another run.
     pub busy_fail: bool,
     /// Receipt to update as the turn progresses (`ask --request-id`).
@@ -1048,6 +1110,8 @@ pub struct Channel {
     submitted: bool,
     /// Receipt kept current as the turn progresses (see `receipt`).
     receipt: Option<PathBuf>,
+    /// This channel was admitted under the Chat-only contract.
+    chat_only: bool,
     /// Exclusive claim on the shared ChatGPT window, released when the channel
     /// is dropped or closed.
     _surface: SurfaceLock,
@@ -1250,6 +1314,7 @@ impl Channel {
             pending_project: None,
             submitted: false,
             receipt: opts.receipt.clone(),
+            chat_only: opts.chat_only,
             _surface: surface,
         };
 
@@ -1304,6 +1369,14 @@ impl Channel {
             })?;
         }
 
+        if opts.chat_only {
+            let chat_deadline = Instant::now() + Duration::from_secs(timeout_secs.min(20));
+            chan.ensure_chat_only_fresh(chat_deadline)
+                .with_context(|| {
+                    "could not prove the Chat surface before submit — Work is forbidden"
+                })?;
+        }
+
         // Apply an explicitly requested model on the now-settled composer (after
         // any project navigation).
         //
@@ -1356,6 +1429,72 @@ impl Channel {
                 })?;
         }
         Ok(())
+    }
+
+    fn chat_work_mode(&self, budget: f64) -> Result<(bool, bool)> {
+        let state = ab_eval(&self.ab, JS_CHAT_WORK_MODE, &self.session, budget)?;
+        if !state.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let detail = state
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            bail!("Chat/Work state is not observable: {detail}");
+        }
+        let chat = state.get("chat").and_then(|v| v.as_bool()).unwrap_or(false);
+        let work = state.get("work").and_then(|v| v.as_bool()).unwrap_or(false);
+        if chat == work {
+            bail!("Chat/Work state is ambiguous (chat={chat}, work={work})");
+        }
+        Ok((chat, work))
+    }
+
+    fn ensure_chat_only_fresh(&self, deadline: Instant) -> Result<()> {
+        let remaining = || {
+            deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::from_secs(2))
+                .as_secs_f64()
+                .max(2.0)
+        };
+        match self.chat_work_mode(remaining()) {
+            Ok((true, false)) => return Ok(()),
+            Ok((false, true)) => {
+                let clicked = ab_eval(&self.ab, JS_CLICK_CHAT_MODE, &self.session, remaining())?;
+                if clicked.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                    bail!("Work is active and the Chat control could not be selected");
+                }
+            }
+            Ok(_) => unreachable!(),
+            Err(e) => return Err(e),
+        }
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(250));
+            if self.chat_work_mode(remaining()).ok() == Some((true, false)) {
+                eprintln!("surface: Chat-only verified");
+                return Ok(());
+            }
+        }
+        bail!("Work was active and Chat could not be verified before submit")
+    }
+
+    fn verify_existing_chat_only(&self, convo_id: &str, budget: f64) -> Result<()> {
+        if chat_only_conversation_proven(convo_id) {
+            eprintln!("surface: Chat-only attestation found for conversation {convo_id}");
+            return Ok(());
+        }
+        match self.chat_work_mode(budget) {
+            Ok((true, false)) => {
+                mark_chat_only_conversation(convo_id)
+                    .context("recording Chat-only attestation for existing conversation")?;
+                eprintln!("surface: existing conversation proven Chat-only from DOM");
+                Ok(())
+            }
+            Ok((false, true)) => bail!("existing conversation is Work; Chat-only execution refused"),
+            Ok(_) => unreachable!(),
+            Err(_) => bail!(
+                "existing conversation has no Chat-only attestation and its Chat/Work type is not observable; refusing legacy conversation"
+            ),
+        }
     }
 
     fn temporary_chat_mode(&self, budget: f64) -> Result<Option<bool>> {
@@ -1957,6 +2096,10 @@ impl Channel {
         let budget = opts.timeout_secs.min(90).max(20) as f64;
         chan.reopen_pinned(budget)
             .with_context(|| format!("could not reopen conversation {}", convo_id.trim()))?;
+        chan.chat_only = opts.chat_only;
+        if opts.chat_only {
+            chan.verify_existing_chat_only(convo_id.trim(), budget)?;
+        }
         if let Some(ref model) = opts.model {
             chan.apply_requested_model(model, opts.timeout_secs)?;
         }
@@ -1977,6 +2120,7 @@ impl Channel {
             temporary: false,
             timeout_secs: opts.timeout_secs,
             model: None,
+            chat_only: false,
             busy_fail: opts.busy_fail,
             receipt: None,
         };
@@ -2093,9 +2237,16 @@ impl Channel {
                 r.submitted = "yes".into();
             }
             if convo.is_some() {
-                r.conversation_id = convo;
+                r.conversation_id = convo.clone();
             }
         });
+        if self.chat_only && submitted {
+            if let Some(id) = convo.as_deref() {
+                if let Err(e) = mark_chat_only_conversation(id) {
+                    eprintln!("warning: could not persist Chat-only attestation for {id}: {e}");
+                }
+            }
+        }
     }
 
     /// Text of a visible dialog on the page, if one is up.
@@ -3840,14 +3991,32 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let bin = dir.join("chrome-use");
         let log = dir.join("calls.log");
+        let fake_mode = if name.contains("chat-only-work") {
+            "work"
+        } else if name.contains("chat-only-ambiguous") {
+            "ambiguous"
+        } else {
+            "chat"
+        };
         let script = r#"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> '__LOG__'
+FAKE_MODE='__MODE__'
 cmd="${1-}"
 if [ "$cmd" = "eval" ]; then
   js="${2-}"
   if printf '%s' "$js" | grep -q 'const present ='; then
     printf '%s\n' '"{\"present\":true}"'
+  elif printf '%s' "$js" | grep -q 'Chat/Work controls not found'; then
+    if [ "$FAKE_MODE" = "work" ]; then
+      printf '%s\n' '"{\"ok\":true,\"chat\":false,\"work\":true}"'
+    elif [ "$FAKE_MODE" = "ambiguous" ]; then
+      printf '%s\n' '"{\"ok\":false,\"error\":\"Chat/Work controls not found\"}"'
+    else
+      printf '%s\n' '"{\"ok\":true,\"chat\":true,\"work\":false}"'
+    fi
+  elif printf '%s' "$js" | grep -q 'Chat control not found'; then
+    printf '%s\n' '"{\"ok\":true}"'
   elif printf '%s' "$js" | grep -q 'already_open'; then
     printf '%s\n' '"{\"ok\":true,\"already_open\":false}"'
   elif printf '%s' "$js" | grep -q 'thinking-effort slider not found'; then
@@ -3867,7 +4036,8 @@ if [ "$cmd" = "eval" ]; then
   fi
 fi
 "#
-        .replace("__LOG__", &log.display().to_string());
+        .replace("__LOG__", &log.display().to_string())
+        .replace("__MODE__", fake_mode);
         std::fs::write(&bin, script).unwrap();
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
         perms.set_mode(0o755);
@@ -3886,8 +4056,59 @@ fi
             pending_project: None,
             submitted: false,
             receipt: None,
+            chat_only: false,
             _surface: SurfaceLock { _file: None },
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_only_accepts_proven_chat_without_clicking_mode_control() {
+        let (ab, log) = fake_chrome_use("chat-only-chat");
+        let channel = fake_channel(ab, None);
+        channel
+            .ensure_chat_only_fresh(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert!(calls.contains("Chat/Work controls not found"), "{calls}");
+        assert!(!calls.contains("Chat control not found"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_only_switches_work_then_requires_verified_chat() {
+        let (ab, _log) = fake_chrome_use("chat-only-work");
+        let channel = fake_channel(ab, None);
+        let result = channel.ensure_chat_only_fresh(Instant::now() + Duration::from_millis(900));
+        assert!(
+            result.is_err(),
+            "a fake surface that stays Work must fail closed"
+        );
+        assert!(format!("{:#}", result.unwrap_err()).contains("Chat could not be verified"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_only_ambiguous_surface_fails_closed() {
+        let (ab, _log) = fake_chrome_use("chat-only-ambiguous");
+        let channel = fake_channel(ab, None);
+        let result = channel.ensure_chat_only_fresh(Instant::now() + Duration::from_secs(2));
+        assert!(result.is_err());
+        assert!(format!("{:#}", result.unwrap_err()).contains("not observable"));
+    }
+
+    #[test]
+    fn legacy_existing_conversation_requires_chat_only_attestation() {
+        let tmp = std::env::temp_dir().join(format!("cgu-chat-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let id = "6abfbbbe-22bc-83ed-a664-e93d365c1346";
+        let marker = chat_only_marker_path_in(&tmp, id).unwrap();
+        assert!(!marker.is_file());
+        mark_chat_only_conversation_at(&tmp, id).unwrap();
+        assert!(marker.is_file());
+        assert!(chat_only_marker_path_in(&tmp, "../escape").is_none());
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[cfg(unix)]
@@ -3951,6 +4172,7 @@ fi
             temporary: false,
             timeout_secs: 60,
             model: Some("__axes__\tGPT-5.6 Sol\thigh".to_string()),
+            chat_only: false,
             busy_fail: false,
             receipt: None,
         };

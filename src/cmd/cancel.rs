@@ -73,6 +73,7 @@ fn cancel(args: &CancelArgs) -> Value {
         temporary: false,
         timeout_secs: args.channel.timeout,
         model: None,
+        chat_only: false,
         busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
         receipt: None,
     };

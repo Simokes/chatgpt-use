@@ -657,6 +657,7 @@ pub fn run(args: &ServeArgs) -> Result<()> {
         temporary: false,
         timeout_secs: args.channel.timeout,
         model: args.channel.model.clone(),
+        chat_only: false,
         busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
         receipt: None,
     };

@@ -130,6 +130,7 @@ fn channel_opts_from_args(args: &RunArgs) -> ChannelOptions {
         temporary: args.channel.temporary,
         timeout_secs: args.channel.timeout,
         model: args.channel.requested_model(),
+        chat_only: false,
         busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
         receipt: None,
     }
