@@ -1727,31 +1727,38 @@ impl Channel {
         Ok(())
     }
 
-    /// Press Enter and return only once a new user turn proves it landed.
+    /// Submit once and return only when a new user turn proves it landed.
     fn submit(&self, baseline_users: u64, budget: f64) -> std::result::Result<(), SubmitFailure> {
-        // From here on a retry could DUPLICATE the message, so every failure is
-        // reported as ambiguous and the caller must not resend blindly.
+        // On the supported Windows+WSL runner the extension relay can edit the
+        // composer but its synthetic Enter/click events are ignored by the
+        // current ChatGPT submit control. A real Windows Enter works reliably,
+        // so prefer it when that host bridge exists. There is intentionally no
+        // second submit attempt after it: once an OS key has been sent, a retry
+        // could duplicate the message.
+        match native_windows_enter(&self.ab, &self.session, budget) {
+            Ok(true) => {
+                if self.await_user_turn(baseline_users, Duration::from_secs(8), budget) {
+                    return Ok(());
+                }
+                return Err(SubmitFailure::Ambiguous(anyhow!(
+                    "native Windows Enter was sent but no new user turn appeared; refusing to resend"
+                )));
+            }
+            Ok(false) => {}
+            Err(e) => return Err(SubmitFailure::Ambiguous(e)),
+        }
+
+        // Portable fallback for non-Windows hosts. From here on a retry could
+        // duplicate the message, so every failure remains ambiguous.
         ab_cmd(&self.ab, &["press", "Enter"], &self.session, budget)
             .context("pressing Enter to submit")
             .map_err(SubmitFailure::Ambiguous)?;
-
-        // Confirm the submit actually landed, by EVIDENCE (a new user turn was
-        // rendered) rather than by the old proxy "is the composer empty?". That
-        // proxy raced React's clear and misread in both directions: a slow clear
-        // looked like a failed submit (→ duplicate send), and a swallowed Enter
-        // with an already-cleared box looked like success (→ we then waited on,
-        // and scraped, the PREVIOUS turn).
         if !self.await_user_turn(baseline_users, Duration::from_secs(3), budget) {
-            // Enter didn't take. Submit through the composer's owning form.
-            // Current ChatGPT ignores synthetic button clicks but accepts the
-            // form's native requestSubmit() path.
             let submitted = ab_eval(&self.ab, JS_SUBMIT_COMPOSER, &self.session, budget)
                 .ok()
                 .and_then(|v| v.get("ok").and_then(|x| x.as_bool()))
                 == Some(true);
-
             if !submitted {
-                // Compatibility fallback for older surfaces.
                 let _ = ab_cmd(
                     &self.ab,
                     &["click", r#"button[data-testid="send-button"]"#],
@@ -1759,17 +1766,12 @@ impl Channel {
                     budget,
                 );
             }
-
             if !self.await_user_turn(baseline_users, Duration::from_secs(5), budget) {
                 return Err(SubmitFailure::Ambiguous(anyhow!(
-                    "the message was never submitted — no new user turn appeared \
-                     after pressing Enter and submitting the composer form. The \
-                     composer may be disabled (rate limit, expired session) or \
-                     the page layout changed."
+                    "the message was never submitted — no new user turn appeared after the portable submit path"
                 )));
             }
         }
-
         Ok(())
     }
 
@@ -3535,6 +3537,47 @@ fn ab_paste(ab: &PathBuf, text: &str, session: &str, timeout_secs: f64) -> Resul
         session,
         timeout_secs,
     )
+}
+
+/// Send a real Enter key to the foreground ChatGPT Chrome window on the
+/// Windows host. Returns `Ok(false)` when the WSL/Windows bridge is absent so
+/// non-Windows callers can use the portable relay path.
+fn native_windows_enter(ab: &PathBuf, session: &str, timeout_secs: f64) -> Result<bool> {
+    let powershell = Path::new("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
+    if !powershell.is_file() {
+        return Ok(false);
+    }
+
+    ab_cmd(ab, &["bringToFront"], session, timeout_secs)
+        .context("bringing the ChatGPT tab to the foreground before native submit")?;
+
+    let script = r#"Add-Type -AssemblyName System.Windows.Forms;
+Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class W { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd); }';
+$p = Get-Process chrome | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -like '*ChatGPT*' } | Select-Object -First 1;
+if (-not $p) { exit 2 };
+[W]::SetForegroundWindow($p.MainWindowHandle) | Out-Null;
+Start-Sleep -Milliseconds 200;
+[System.Windows.Forms.SendKeys]::SendWait('{ENTER}')"#;
+
+    let output = Command::new(powershell)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ])
+        .output()
+        .context("running native Windows Enter submit")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "native Windows Enter submit failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        );
+    }
+    Ok(true)
 }
 
 /// Run a chrome-use subcommand with optional profile; return stdout.
