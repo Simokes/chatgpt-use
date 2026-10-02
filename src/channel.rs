@@ -3552,11 +3552,13 @@ fn native_windows_enter(ab: &PathBuf, session: &str, timeout_secs: f64) -> Resul
         .context("bringing the ChatGPT tab to the foreground before native submit")?;
 
     let script = r#"Add-Type -AssemblyName System.Windows.Forms;
-Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class W { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd); }';
-$p = Get-Process chrome | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -like '*ChatGPT*' } | Select-Object -First 1;
-if (-not $p) { exit 2 };
-[W]::SetForegroundWindow($p.MainWindowHandle) | Out-Null;
+Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class W { [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId); }';
 Start-Sleep -Milliseconds 200;
+$h = [W]::GetForegroundWindow();
+$procId = [uint32]0;
+[void][W]::GetWindowThreadProcessId($h, [ref]$procId);
+$p = Get-Process -Id $procId -ErrorAction SilentlyContinue;
+if (-not $p -or $p.ProcessName -ne 'chrome') { exit 2 };
 [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')"#;
 
     let output = Command::new(powershell)
