@@ -395,17 +395,6 @@ const JS_USER_COUNT: &str = r#"(() => {
   return JSON.stringify(count);
 })()"#;
 
-// JS: empty the composer, so a leftover fragment from an aborted turn can't be
-// prepended to the next message.
-const JS_CLEAR_COMPOSER: &str = r#"(() => {
-  const c = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]');
-  if (!c) return JSON.stringify({ok: false});
-  c.focus();
-  document.execCommand('selectAll');
-  document.execCommand('delete');
-  return JSON.stringify({ok: true});
-})()"#;
-
 const JS_SUBMIT_COMPOSER: &str = r#"(() => {
   const composer = document.querySelector(
     '#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]'
@@ -1659,15 +1648,19 @@ impl Channel {
             budget,
         )
         .context("clicking ChatGPT composer")?;
-        // Clear, then CONFIRM the composer is actually empty. One `delete` is not
-        // enough after a reattach: the page may still be hydrating, and ChatGPT
-        // restores a saved draft into the composer once it is — which silently
-        // prepends a stray character to the prompt. (Seen live: a 26 KB payload
-        // arrived one character long, which the integrity check below correctly
-        // rejected.) Whitespace is ignored, so only real leftover text blocks us.
+        // Clear through chrome-use's native editor adapter, then confirm the
+        // logical content is empty. This updates ProseMirror's own state, unlike
+        // a raw execCommand delete that can be overwritten by draft hydration.
+        // The fingerprint ignores whitespace, so the editor's trailing newline
+        // still counts as empty.
         let mut cleared = false;
         for _ in 0..5 {
-            let _ = ab_eval(&self.ab, JS_CLEAR_COMPOSER, &self.session, budget);
+            let _ = ab_cmd(
+                &self.ab,
+                &["fill", COMPOSER_SELECTOR, ""],
+                &self.session,
+                budget,
+            );
             if ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget)
                 .ok()
                 .and_then(|v| v.get("n").and_then(|n| n.as_u64()))
@@ -1685,10 +1678,9 @@ impl Channel {
             );
         }
 
-        // Let chrome-use perform the editor-specific write. Its native `fill`
-        // command handles ProseMirror/contenteditable and accepts stdin for long
-        // prompts, which is both simpler and less fragile than maintaining our
-        // own execCommand transaction. We still verify the exact rendered
+        // Let chrome-use perform the editor-specific write through its native
+        // paste adapter, which targets the live textarea/ProseMirror in one
+        // action. We still verify the exact rendered
         // fingerprint before Enter, so a truncated/polluted write remains
         // fail-closed and safe to retry.
         const FILL_ATTEMPTS: usize = 3;
@@ -4288,7 +4280,7 @@ fi
         assert!(JS_STATE.contains(r#"[data-content-search-unit-key$=":user"]"#));
         assert!(JS_STATE.contains(r#"[data-content-search-unit-key$=":assistant"]"#));
         assert!(JS_LAST_ASSISTANT.contains(r#"[data-markdown-text-style="assistant-message"]"#));
-        for js in [JS_COMPOSER, JS_CLEAR_COMPOSER, JS_COMPOSER_FINGERPRINT] {
+        for js in [JS_COMPOSER, JS_COMPOSER_FINGERPRINT] {
             assert!(js.contains("#prompt-textarea"), "{js}");
             assert!(
                 js.contains(r#"div.ProseMirror[contenteditable="true"][role="textbox"]"#),
