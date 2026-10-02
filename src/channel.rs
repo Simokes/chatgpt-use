@@ -1627,6 +1627,9 @@ impl Channel {
         // the live composer itself so the key cannot land in another Chrome
         // window. There is intentionally no second submit attempt: once Enter
         // has been sent, resending could duplicate the message.
+        ab_cmd(&self.ab, &["bringToFront"], &self.session, budget)
+            .context("bringing the ChatGPT tab to the foreground immediately before Enter")
+            .map_err(SubmitFailure::Ambiguous)?;
         ab_cmd(
             &self.ab,
             &["press", "Enter", "--selector", COMPOSER_SELECTOR],
