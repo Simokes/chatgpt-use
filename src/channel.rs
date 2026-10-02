@@ -1587,6 +1587,42 @@ impl Channel {
     /// Replace the live composer content and verify it landed intact. Nothing
     /// here can submit anything, so any error is safe to retry.
     fn fill_composer(&self, message: &str, budget: f64) -> Result<()> {
+        // Clear any restored draft through chrome-use's native editor adapter
+        // before replacing the composer from file. Require the empty state to
+        // remain stable across a short interval: ChatGPT can hydrate an old
+        // draft just after the first clear, which would otherwise be appended
+        // to the review prompt and make chrome-use's own fill verification fail.
+        let mut cleared = false;
+        for _ in 0..5 {
+            let _ = ab_cmd(
+                &self.ab,
+                &["fill", COMPOSER_SELECTOR, ""],
+                &self.session,
+                budget,
+            );
+            let empty_now = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget)
+                .ok()
+                .and_then(|v| v.get("n").and_then(|n| n.as_u64()))
+                == Some(0);
+            if empty_now {
+                std::thread::sleep(Duration::from_millis(300));
+                let still_empty = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget)
+                    .ok()
+                    .and_then(|v| v.get("n").and_then(|n| n.as_u64()))
+                    == Some(0);
+                if still_empty {
+                    cleared = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        if !cleared {
+            bail!(
+                "could not keep the ChatGPT composer empty long enough to replace a restored draft"
+            );
+        }
+
         let path = std::env::temp_dir().join(format!(
             "chatgpt-use-composer-{}-{}.txt",
             std::process::id(),
