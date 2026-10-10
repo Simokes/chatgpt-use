@@ -1743,20 +1743,25 @@ impl Channel {
         // so prefer it when that host bridge exists. There is intentionally no
         // second submit attempt after it: once an OS key has been sent, a retry
         // could duplicate the message.
-        match native_windows_enter(&self.ab, &self.session, budget) {
-            Ok(true) => {
-                if self.await_user_turn(baseline_users, Duration::from_secs(8), budget) {
-                    return Ok(());
+        let github_actions = std::env::var("GITHUB_ACTIONS").ok();
+        if prefer_native_windows_submit(github_actions.as_deref()) {
+            match native_windows_enter(&self.ab, &self.session, budget) {
+                Ok(true) => {
+                    if self.await_user_turn(baseline_users, Duration::from_secs(8), budget) {
+                        return Ok(());
+                    }
+                    return Err(SubmitFailure::Ambiguous(anyhow!(
+                        "native Windows Enter was sent but no new user turn appeared; refusing to resend"
+                    )));
                 }
-                return Err(SubmitFailure::Ambiguous(anyhow!(
-                    "native Windows Enter was sent but no new user turn appeared; refusing to resend"
-                )));
+                Ok(false) => {}
+                Err(e) => return Err(SubmitFailure::Ambiguous(e)),
             }
-            Ok(false) => {}
-            Err(e) => return Err(SubmitFailure::Ambiguous(e)),
+        } else {
+            eprintln!("GitHub Actions detected; skipping native Windows Enter submit");
         }
 
-        // Portable fallback for non-Windows hosts. From here on a retry could
+        // Portable fallback for non-Windows hosts and unattended CI. From here on a retry could
         // duplicate the message, so every failure remains ambiguous.
         ab_cmd(&self.ab, &["press", "Enter"], &self.session, budget)
             .context("pressing Enter to submit")
@@ -3550,6 +3555,10 @@ fn ab_paste(ab: &PathBuf, text: &str, session: &str, timeout_secs: f64) -> Resul
 /// Send a real Enter key to the foreground ChatGPT Chrome window on the
 /// Windows host. Returns `Ok(false)` when the WSL/Windows bridge is absent so
 /// non-Windows callers can use the portable relay path.
+fn prefer_native_windows_submit(github_actions: Option<&str>) -> bool {
+    !github_actions.is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
 fn native_windows_enter(ab: &PathBuf, session: &str, timeout_secs: f64) -> Result<bool> {
     let powershell = Path::new("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
     if !powershell.is_file() {
@@ -4362,6 +4371,14 @@ fi
             js.contains("backend-api/projects"),
             "JS should reference the project API"
         );
+    }
+
+    #[test]
+    fn github_actions_uses_portable_submit_path() {
+        assert!(!prefer_native_windows_submit(Some("true")));
+        assert!(!prefer_native_windows_submit(Some("TRUE")));
+        assert!(prefer_native_windows_submit(Some("false")));
+        assert!(prefer_native_windows_submit(None));
     }
 
     #[test]
