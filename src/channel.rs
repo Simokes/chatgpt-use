@@ -1737,16 +1737,15 @@ impl Channel {
 
     /// Submit once and return only when a new user turn proves it landed.
     fn submit(&self, baseline_users: u64, budget: f64) -> std::result::Result<(), SubmitFailure> {
-        // On the supported Windows+WSL runner the extension relay can edit the
-        // composer but its synthetic Enter/click events are ignored by the
-        // current ChatGPT submit control. A real Windows Enter works reliably,
-        // so prefer it when that host bridge exists. There is intentionally no
-        // second submit attempt after it: once an OS key has been sent, a retry
-        // could duplicate the message.
+        // Portable browser submission is the default, including manual WSL runs.
+        // Native SendKeys requires an explicit opt-in: bringing a tab forward
+        // does not guarantee that Chrome owns the foreground Windows window.
+        // Once an OS key has been sent, never retry without a receipt.
         let github_actions = std::env::var("GITHUB_ACTIONS").ok();
-        if prefer_native_windows_submit(github_actions.as_deref()) {
+        let submit_transport = std::env::var("CHATGPT_USE_SUBMIT_TRANSPORT").ok();
+        if prefer_native_windows_submit(github_actions.as_deref(), submit_transport.as_deref()) {
             match native_windows_enter(&self.ab, &self.session, budget) {
-                Ok(true) => {
+                Ok(NativeSubmitOutcome::Sent) => {
                     if self.await_user_turn(baseline_users, Duration::from_secs(8), budget) {
                         return Ok(());
                     }
@@ -1754,11 +1753,20 @@ impl Channel {
                         "native Windows Enter was sent but no new user turn appeared; refusing to resend"
                     )));
                 }
-                Ok(false) => {}
+                Ok(NativeSubmitOutcome::Unavailable) => {}
+                Ok(NativeSubmitOutcome::NotSent) => {
+                    return Err(SubmitFailure::BeforeSubmit(
+                        ChannelError::new(
+                            ErrorKind::NotSubmitted,
+                            "Chrome was not the foreground Windows window; no Enter key was sent",
+                        )
+                        .into(),
+                    ));
+                }
                 Err(e) => return Err(SubmitFailure::Ambiguous(e)),
             }
         } else {
-            eprintln!("GitHub Actions detected; skipping native Windows Enter submit");
+            eprintln!("using portable browser submission (no native Windows Enter)");
         }
 
         // Portable fallback for non-Windows hosts and unattended CI. From here on a retry could
@@ -3553,16 +3561,37 @@ fn ab_paste(ab: &PathBuf, text: &str, session: &str, timeout_secs: f64) -> Resul
 }
 
 /// Send a real Enter key to the foreground ChatGPT Chrome window on the
-/// Windows host. Returns `Ok(false)` when the WSL/Windows bridge is absent so
+/// Windows host. Returns `Unavailable` when the WSL/Windows bridge is absent so
 /// non-Windows callers can use the portable relay path.
-fn prefer_native_windows_submit(github_actions: Option<&str>) -> bool {
-    !github_actions.is_some_and(|v| v.eq_ignore_ascii_case("true"))
+fn prefer_native_windows_submit(github_actions: Option<&str>, transport: Option<&str>) -> bool {
+    transport.is_some_and(|v| v.eq_ignore_ascii_case("native"))
+        && !github_actions.is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
-fn native_windows_enter(ab: &PathBuf, session: &str, timeout_secs: f64) -> Result<bool> {
+#[derive(Debug, PartialEq, Eq)]
+enum NativeSubmitOutcome {
+    Unavailable,
+    Sent,
+    NotSent,
+}
+
+fn native_submit_outcome(code: Option<i32>) -> Option<NativeSubmitOutcome> {
+    match code {
+        Some(0) => Some(NativeSubmitOutcome::Sent),
+        // The PowerShell guard exits 2 BEFORE calling SendKeys.
+        Some(2) => Some(NativeSubmitOutcome::NotSent),
+        _ => None,
+    }
+}
+
+fn native_windows_enter(
+    ab: &PathBuf,
+    session: &str,
+    timeout_secs: f64,
+) -> Result<NativeSubmitOutcome> {
     let powershell = Path::new("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
     if !powershell.is_file() {
-        return Ok(false);
+        return Ok(NativeSubmitOutcome::Unavailable);
     }
 
     ab_cmd(ab, &["focus", COMPOSER_SELECTOR], session, timeout_secs)
@@ -3590,7 +3619,9 @@ if (-not $p -or $p.ProcessName -ne 'chrome') { exit 2 };
         ])
         .output()
         .context("running native Windows Enter submit")?;
-    if !output.status.success() {
+    if let Some(outcome) = native_submit_outcome(output.status.code()) {
+        return Ok(outcome);
+    } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
             "native Windows Enter submit failed (exit {}): {}",
@@ -3598,7 +3629,6 @@ if (-not $p -or $p.ProcessName -ne 'chrome') { exit 2 };
             stderr.trim()
         );
     }
-    Ok(true)
 }
 
 /// Run a chrome-use subcommand with optional profile; return stdout.
@@ -4375,10 +4405,33 @@ fi
 
     #[test]
     fn github_actions_uses_portable_submit_path() {
-        assert!(!prefer_native_windows_submit(Some("true")));
-        assert!(!prefer_native_windows_submit(Some("TRUE")));
-        assert!(prefer_native_windows_submit(Some("false")));
-        assert!(prefer_native_windows_submit(None));
+        assert!(!prefer_native_windows_submit(Some("true"), Some("native")));
+        assert!(!prefer_native_windows_submit(Some("TRUE"), Some("native")));
+        assert!(!prefer_native_windows_submit(Some("false"), None));
+        assert!(!prefer_native_windows_submit(None, None));
+        assert!(!prefer_native_windows_submit(None, Some("portable")));
+        assert!(prefer_native_windows_submit(None, Some("native")));
+    }
+
+    #[test]
+    fn native_pre_send_guard_is_not_an_ambiguous_submission() {
+        assert_eq!(
+            native_submit_outcome(Some(2)),
+            Some(NativeSubmitOutcome::NotSent)
+        );
+        assert_eq!(
+            native_submit_outcome(Some(0)),
+            Some(NativeSubmitOutcome::Sent)
+        );
+        assert_eq!(native_submit_outcome(Some(1)), None);
+        assert_eq!(native_submit_outcome(None), None);
+        let error = SubmitFailure::BeforeSubmit(
+            ChannelError::new(ErrorKind::NotSubmitted, "no key sent").into(),
+        )
+        .into_error();
+        let channel = error.downcast_ref::<ChannelError>().unwrap();
+        assert_eq!(channel.kind, ErrorKind::NotSubmitted);
+        assert_eq!(channel.submitted, Submitted::No);
     }
 
     #[test]
