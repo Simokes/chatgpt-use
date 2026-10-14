@@ -2863,8 +2863,8 @@ impl Channel {
         })()"#;
         let js = script
             .replace("PRELUDE", JS_TOKEN_PRELUDE)
-            .replace("MARKER", &serde_json::to_string(marker)?)
-            .replace("CREATED", &created_at.to_string());
+            .replace("CREATED", &created_at.to_string())
+            .replace("MARKER", &serde_json::to_string(marker)?);
         Ok(js)
     }
 
@@ -3960,7 +3960,7 @@ mod tests {
             "partial",
             "assistant-only",
         ] {
-            let js = super::Channel::request_marker_scan_script("[request: test]", 1).unwrap();
+            let js = super::Channel::request_marker_scan_script("[request: CREATED]", 1).unwrap();
             let fixture = format!(
                 r#"
                 const mode = {mode:?};
@@ -3968,7 +3968,7 @@ mod tests {
                 global.fetch = async url => {{
                     const data = url.includes('conversations?')
                       ? {{items: [{{id: 'fixture', update_time: '2026-10-14T00:00:00Z'}}], total: mode === 'partial' ? 2 : 1}}
-                      : mode === 'malformed' ? {{}} : {{mapping: {{a: {{message: {{author: {{role: mode === 'assistant-only' ? 'assistant' : 'user'}}, content: {{parts: [mode === 'absent' ? 'other request' : '[request: test]']}}}}}}}}}};
+                      : mode === 'malformed' ? {{}} : {{mapping: {{a: {{message: {{author: {{role: mode === 'assistant-only' ? 'assistant' : 'user'}}, content: {{parts: [mode === 'absent' || mode === 'partial' ? 'other request' : '[request: CREATED]']}}}}}}}}}};
                     return {{ok: mode !== 'error', status: 500, json: async () => data}};
                 }};
                 Promise.resolve({js}).then(console.log);
