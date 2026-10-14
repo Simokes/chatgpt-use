@@ -1058,6 +1058,9 @@ pub struct Channel {
     submitted: bool,
     /// Receipt kept current as the turn progresses (see `receipt`).
     receipt: Option<PathBuf>,
+    /// Absence searches apply only to persisted plain chats, never temporary
+    /// chats or projects that the recent-conversations endpoint may omit.
+    receipt_searchable: bool,
     /// This channel was admitted under the Chat-only contract.
     chat_only: bool,
     /// Model/effort request that must be re-established on the final composer
@@ -1265,6 +1268,7 @@ impl Channel {
             pending_project: None,
             submitted: false,
             receipt: opts.receipt.clone(),
+            receipt_searchable: !opts.temporary && opts.project.trim().is_empty(),
             chat_only: opts.chat_only,
             requested_model: opts.model.clone(),
             _surface: surface,
@@ -2244,6 +2248,9 @@ impl Channel {
         // Persist the exact search key before any possible send. A receipt
         // without this key can never be proven unsent by a marker search.
         let marked_message = self.receipt.as_ref().and_then(|path| {
+            if !self.receipt_searchable || !self.project.is_empty() {
+                return None;
+            }
             let r = crate::receipt::load(path)?;
             let marker = format!("[chatgpt-use request-id: {}]", r.request_id);
             crate::receipt::update(path, |r| r.request_marker = Some(marker.clone()));
@@ -4335,6 +4342,7 @@ fi
             pending_project: None,
             submitted: false,
             receipt: None,
+            receipt_searchable: true,
             chat_only: false,
             requested_model: None,
             _surface: SurfaceLock { _file: None },
