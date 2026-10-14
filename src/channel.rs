@@ -438,7 +438,7 @@ const JS_DISMISS_DIALOG: &str = r#"(() => {
 // both sides can compute identically.
 const JS_COMPOSER_FINGERPRINT: &str = r#"(() => {
   const c = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]');
-  const t = c ? (c.innerText || c.textContent || '') : '';
+  const t = c ? (c.value ?? c.innerText ?? c.textContent ?? '') : '';
   const isWs = (u) =>
     (u >= 0x09 && u <= 0x0d) || u === 0x20 || u === 0x85 || u === 0xa0 ||
     u === 0x1680 || (u >= 0x2000 && u <= 0x200a) || u === 0x2028 ||
@@ -454,7 +454,7 @@ const JS_COMPOSER_FINGERPRINT: &str = r#"(() => {
     h = (h ^ (u >>> 8)) >>> 0;
     h = Math.imul(h, 0x01000193) >>> 0;
   }
-  return JSON.stringify({n: n, h: h});
+  return JSON.stringify({present: !!c, text: t, n: n, h: h});
 })()"#;
 
 /// A JS prelude every backend call shares: fetch the page's bearer token ONCE
@@ -489,6 +489,29 @@ const __cguToken = async () => {
   } catch (e) {
     return null;
   }
+};
+"#;
+
+// Fetch current credentials freshly: a cached bearer from another login is
+// not proof of the account presently used by the submission surface. Return
+// only the stable user/account identity to Rust, never the bearer itself.
+const JS_ACCOUNT_PRELUDE: &str = r#"
+const __cguAccount = async () => {
+  const response = await fetch('/api/auth/session', {credentials: 'include', cache: 'no-store'});
+  if (!response.ok) throw new Error('account identity unavailable');
+  const s = await response.json();
+  const token = s && s.accessToken;
+  if (typeof token !== 'string') throw new Error('account token unavailable');
+  const encoded = token.split('.')[1];
+  if (!encoded) throw new Error('account claims unavailable');
+  const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+  const claims = JSON.parse(atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, '=')));
+  const auth = claims['https://api.openai.com/auth'];
+  const user = s.user && s.user.id;
+  const account = auth && auth.chatgpt_account_id;
+  if (typeof user !== 'string' || !user || typeof account !== 'string' || !account)
+    throw new Error('stable user/account identity unavailable');
+  return {token, identity: JSON.stringify([user, account])};
 };
 "#;
 
@@ -1058,6 +1081,9 @@ pub struct Channel {
     submitted: bool,
     /// Receipt kept current as the turn progresses (see `receipt`).
     receipt: Option<PathBuf>,
+    /// Absence searches apply only to persisted plain chats, never temporary
+    /// chats or projects that the recent-conversations endpoint may omit.
+    receipt_searchable: bool,
     /// This channel was admitted under the Chat-only contract.
     chat_only: bool,
     /// Model/effort request that must be re-established on the final composer
@@ -1265,6 +1291,7 @@ impl Channel {
             pending_project: None,
             submitted: false,
             receipt: opts.receipt.clone(),
+            receipt_searchable: !opts.temporary && opts.project.trim().is_empty(),
             chat_only: opts.chat_only,
             requested_model: opts.model.clone(),
             _surface: surface,
@@ -1593,6 +1620,23 @@ impl Channel {
             .map_err(SubmitFailure::BeforeSubmit)?;
         self.fill_composer(message, budget)
             .map_err(SubmitFailure::BeforeSubmit)?;
+        if self.receipt.is_some()
+            && self.receipt_searchable
+            && self.convo_id.is_none()
+            && self.project.is_empty()
+        {
+            let js = format!(
+                r#"(async () => {{ {JS_ACCOUNT_PRELUDE}
+                try {{ const a = await __cguAccount(); return JSON.stringify({{account: a.identity}}); }}
+                catch (_) {{ return JSON.stringify({{}}); }} }})()"#
+            );
+            let account = ab_eval(&self.ab, &js, &self.session, budget)
+                .ok()
+                .and_then(|v| v["account"].as_str().map(str::to_string));
+            if let Some(path) = &self.receipt {
+                crate::receipt::update(path, |r| r.submission_account = account);
+            }
+        }
         self.submit(baseline_users, budget)
     }
 
@@ -1670,9 +1714,8 @@ impl Channel {
                 budget,
             );
             if ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget)
-                .ok()
-                .and_then(|v| v.get("n").and_then(|n| n.as_u64()))
-                == Some(0)
+                .as_ref()
+                .is_ok_and(composer_is_empty)
             {
                 cleared = true;
                 break;
@@ -1680,10 +1723,14 @@ impl Channel {
             std::thread::sleep(Duration::from_millis(300));
         }
         if !cleared {
-            bail!(
-                "could not empty the ChatGPT composer — leftover text would be \
-                 prepended to the message"
-            );
+            // Draft hydration can race the native clear. Read once more after
+            // settling, without another write, before refusing a safe submit.
+            std::thread::sleep(Duration::from_millis(500));
+            let observed = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget);
+            eprintln!("composer clear re-check: {observed:?}");
+            if !observed.as_ref().is_ok_and(composer_is_empty) {
+                bail!("could not empty the ChatGPT composer — leftover text would be prepended to the message; observed {observed:?}");
+            }
         }
 
         // Let chrome-use perform the editor-specific write through its native
@@ -1737,16 +1784,15 @@ impl Channel {
 
     /// Submit once and return only when a new user turn proves it landed.
     fn submit(&self, baseline_users: u64, budget: f64) -> std::result::Result<(), SubmitFailure> {
-        // On the supported Windows+WSL runner the extension relay can edit the
-        // composer but its synthetic Enter/click events are ignored by the
-        // current ChatGPT submit control. A real Windows Enter works reliably,
-        // so prefer it when that host bridge exists. There is intentionally no
-        // second submit attempt after it: once an OS key has been sent, a retry
-        // could duplicate the message.
+        // Portable browser submission is the default, including manual WSL runs.
+        // Native SendKeys requires an explicit opt-in: bringing a tab forward
+        // does not guarantee that Chrome owns the foreground Windows window.
+        // Once an OS key has been sent, never retry without a receipt.
         let github_actions = std::env::var("GITHUB_ACTIONS").ok();
-        if prefer_native_windows_submit(github_actions.as_deref()) {
+        let submit_transport = std::env::var("CHATGPT_USE_SUBMIT_TRANSPORT").ok();
+        if prefer_native_windows_submit(github_actions.as_deref(), submit_transport.as_deref()) {
             match native_windows_enter(&self.ab, &self.session, budget) {
-                Ok(true) => {
+                Ok(NativeSubmitOutcome::Sent) => {
                     if self.await_user_turn(baseline_users, Duration::from_secs(8), budget) {
                         return Ok(());
                     }
@@ -1754,11 +1800,20 @@ impl Channel {
                         "native Windows Enter was sent but no new user turn appeared; refusing to resend"
                     )));
                 }
-                Ok(false) => {}
+                Ok(NativeSubmitOutcome::Unavailable) => {}
+                Ok(NativeSubmitOutcome::NotSent) => {
+                    return Err(SubmitFailure::BeforeSubmit(
+                        ChannelError::new(
+                            ErrorKind::NotSubmitted,
+                            "Chrome was not the foreground Windows window; no Enter key was sent",
+                        )
+                        .into(),
+                    ));
+                }
                 Err(e) => return Err(SubmitFailure::Ambiguous(e)),
             }
         } else {
-            eprintln!("GitHub Actions detected; skipping native Windows Enter submit");
+            eprintln!("using portable browser submission (no native Windows Enter)");
         }
 
         // Portable fallback for non-Windows hosts and unattended CI. From here on a retry could
@@ -1780,6 +1835,9 @@ impl Channel {
                 );
             }
             if !self.await_user_turn(baseline_users, Duration::from_secs(5), budget) {
+                if let Some(path) = &self.receipt {
+                    crate::receipt::update(path, |r| r.no_user_turn = true);
+                }
                 return Err(SubmitFailure::Ambiguous(anyhow!(
                     "the message was never submitted — no new user turn appeared after the portable submit path"
                 )));
@@ -2052,7 +2110,7 @@ impl Channel {
         let plain = existing_conversation_connect_options(opts);
         let mut chan = Channel::connect_with(&plain, false)?;
         chan.project = opts.project.trim().to_string();
-        chan.convo_id = Some(convo_id.trim().to_string());
+        chan.pin_existing(convo_id);
         chan.submitted = false;
         let budget = opts.timeout_secs.min(90).max(20) as f64;
         chan.chat_only = opts.chat_only;
@@ -2064,6 +2122,14 @@ impl Channel {
             )
         })?;
         Ok(chan)
+    }
+
+    fn pin_existing(&mut self, convo_id: &str) {
+        self.convo_id = Some(convo_id.trim().to_string());
+        // Membership of an existing chat is not established by --project.
+        // Exclude every existing target from unpinned absence resolution.
+        self.receipt_searchable = false;
+        self.touch_receipt();
     }
 
     /// Attach to an existing conversation to read its reply, without typing.
@@ -2227,6 +2293,18 @@ impl Channel {
     }
 
     fn send_turn(&mut self, message: &str, sopts: &SendOptions) -> Result<String> {
+        // Persist the exact search key before any possible send. A receipt
+        // without this key can never be proven unsent by a marker search.
+        let marked_message = self.receipt.as_ref().and_then(|path| {
+            if !self.receipt_searchable || !self.project.is_empty() {
+                return None;
+            }
+            let r = crate::receipt::load(path)?;
+            let marker = format!("[chatgpt-use request-id: {}]", r.request_id);
+            crate::receipt::update(path, |r| r.request_marker = Some(marker.clone()));
+            Some(format!("{message}\n\n{marker}"))
+        });
+        let message = marked_message.as_deref().unwrap_or(message);
         let deadline = Instant::now() + Duration::from_secs(self.timeout_secs);
 
         let remaining_secs = || {
@@ -2642,6 +2720,12 @@ impl Channel {
                 continue;
             }
 
+            if !rendered_reply_has_content(&atext) {
+                idle_count = 0;
+                stable_polls = 0;
+                continue;
+            }
+
             // We only reach here with the stop button GONE and no tool active —
             // i.e. generation has actually ended (a genuine mid-stream gap keeps
             // `stop` true, so we `continue` above and never land here). Fast path:
@@ -2657,7 +2741,7 @@ impl Channel {
             // poll — stop button absent, previous reply static — and we scrape
             // the PREVIOUS turn's text and return it as this turn's answer.
             // Fail closed: no new turn means we keep waiting, then time out.
-            if cur_count > baseline_count {
+            if cur_count > baseline_count && rendered_reply_has_content(&atext) {
                 if !atext.is_empty() && atext == prev_stable {
                     stable_polls += 1;
                     if stable_polls >= stable_needed {
@@ -2699,6 +2783,10 @@ impl Channel {
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| last_atext.clone());
+
+        if !rendered_reply_has_content(&reply_text) {
+            return self.await_record();
+        }
 
         self.finish_turn(reply_text, remaining_secs())
     }
@@ -2770,6 +2858,69 @@ impl Channel {
     pub fn eval(&self, js: &str) -> Result<serde_json::Value> {
         let t = (self.timeout_secs.min(30) as f64).max(5.0);
         ab_eval(&self.ab, js, &self.session, t)
+    }
+
+    /// Read every conversation updated since this request was created. Missing
+    /// pages/records, malformed timestamps and scan limits all remain unknown.
+    pub fn scan_request_marker(
+        &self,
+        marker: &str,
+        created_at: u64,
+        account: &str,
+    ) -> Result<serde_json::Value> {
+        let js = Self::request_marker_scan_script(marker, created_at, account)?;
+        ab_eval(&self.ab, &js, &self.session, self.timeout_secs as f64)
+    }
+
+    fn request_marker_scan_script(marker: &str, created_at: u64, account: &str) -> Result<String> {
+        let script = r#"(async () => {
+          PRELUDE
+          try {
+            const current = await __cguAccount();
+            if (current.identity !== ACCOUNT) throw new Error('submission account mismatch');
+            const tok = current.token;
+            const get = async url => {
+              const r = await fetch(url, {credentials: 'include', headers: {Authorization: 'Bearer ' + tok}});
+              if (!r.ok) throw new Error('HTTP ' + r.status);
+              return await r.json();
+            };
+            const marker = MARKER;
+            const cutoff = CREATED * 1000 - 60000;
+            let checked = 0;
+            for (let offset = 0; offset < 1000; offset += 100) {
+              const page = await get('/backend-api/conversations?offset=' + offset + '&limit=100&order=updated');
+              if (!Array.isArray(page.items) || !Number.isInteger(page.total) || page.total < 0)
+                throw new Error('invalid conversation listing');
+              for (const item of page.items) {
+                const updated = Date.parse(item.update_time);
+                if (!item.id || !Number.isFinite(updated)) throw new Error('invalid conversation metadata');
+                if (updated < cutoff) continue;
+                const record = await get('/backend-api/conversation/' + encodeURIComponent(item.id));
+                if (!record.mapping || typeof record.mapping !== 'object') throw new Error('missing conversation mapping');
+                checked++;
+                for (const node of Object.values(record.mapping)) {
+                  const m = node && node.message;
+                  if (m && m.author && m.author.role === 'user') {
+                    const parts = m.content && m.content.parts;
+                    if (!Array.isArray(parts)) throw new Error('unreadable user message');
+                    if (parts.some(p => typeof p === 'string' && p.includes(marker)))
+                      return JSON.stringify({ok: true, found: true, conversation_id: item.id, checked});
+                  }
+                }
+              }
+              if (offset + page.items.length >= page.total)
+                return JSON.stringify({ok: true, found: false, complete: true, checked});
+              if (page.items.length !== 100) throw new Error('incomplete conversation page');
+            }
+            throw new Error('conversation scan limit reached');
+          } catch(e) { return JSON.stringify({ok: false, error: String(e)}); }
+        })()"#;
+        let js = script
+            .replace("PRELUDE", JS_ACCOUNT_PRELUDE)
+            .replace("CREATED", &created_at.to_string())
+            .replace("ACCOUNT", &serde_json::to_string(account)?)
+            .replace("MARKER", &serde_json::to_string(marker)?);
+        Ok(js)
     }
 
     /// Navigate the open session into the named ChatGPT Project, creating it on
@@ -3200,6 +3351,36 @@ struct ServerTurn {
 /// so it is an incomplete turn, never a reply. Only KNOWN cut-offs count
 /// against a reply; an unrecognised finish type passes as a normal finish, so
 /// a model that labels its stop differently keeps working.
+fn composer_is_empty(v: &serde_json::Value) -> bool {
+    v.get("present").and_then(|v| v.as_bool()) == Some(true)
+        && v.get("n").and_then(|v| v.as_u64()) == Some(0)
+}
+
+// DOM text may consist solely of a localized role heading, before any tokens
+// arrive. Very short DOM text is also provisional; short real answers remain
+// valid when the authoritative server record closes the turn.
+fn rendered_reply_has_content(text: &str) -> bool {
+    let text = text.trim();
+    if text.chars().count() < 24 {
+        return false;
+    }
+    if text.to_lowercase().starts_with("chatgpt")
+        && text.ends_with([':', '：'])
+        && !text.contains('\n')
+        && text.chars().count() < 100
+    {
+        return false;
+    }
+    !text
+        .trim_end_matches([':', '：', ' '])
+        .trim()
+        .eq_ignore_ascii_case("ChatGPT said")
+        && !text
+            .trim_end_matches([':', '：', ' '])
+            .trim()
+            .eq_ignore_ascii_case("ChatGPT a dit")
+}
+
 fn judge_record(turn: ServerTurn) -> Result<Option<String>> {
     match turn.finish.as_deref() {
         Some(kind @ ("interrupted" | "max_tokens")) => {
@@ -3553,16 +3734,37 @@ fn ab_paste(ab: &PathBuf, text: &str, session: &str, timeout_secs: f64) -> Resul
 }
 
 /// Send a real Enter key to the foreground ChatGPT Chrome window on the
-/// Windows host. Returns `Ok(false)` when the WSL/Windows bridge is absent so
+/// Windows host. Returns `Unavailable` when the WSL/Windows bridge is absent so
 /// non-Windows callers can use the portable relay path.
-fn prefer_native_windows_submit(github_actions: Option<&str>) -> bool {
-    !github_actions.is_some_and(|v| v.eq_ignore_ascii_case("true"))
+fn prefer_native_windows_submit(github_actions: Option<&str>, transport: Option<&str>) -> bool {
+    transport.is_some_and(|v| v.eq_ignore_ascii_case("native"))
+        && !github_actions.is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
-fn native_windows_enter(ab: &PathBuf, session: &str, timeout_secs: f64) -> Result<bool> {
+#[derive(Debug, PartialEq, Eq)]
+enum NativeSubmitOutcome {
+    Unavailable,
+    Sent,
+    NotSent,
+}
+
+fn native_submit_outcome(code: Option<i32>) -> Option<NativeSubmitOutcome> {
+    match code {
+        Some(0) => Some(NativeSubmitOutcome::Sent),
+        // The PowerShell guard exits 2 BEFORE calling SendKeys.
+        Some(2) => Some(NativeSubmitOutcome::NotSent),
+        _ => None,
+    }
+}
+
+fn native_windows_enter(
+    ab: &PathBuf,
+    session: &str,
+    timeout_secs: f64,
+) -> Result<NativeSubmitOutcome> {
     let powershell = Path::new("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe");
     if !powershell.is_file() {
-        return Ok(false);
+        return Ok(NativeSubmitOutcome::Unavailable);
     }
 
     ab_cmd(ab, &["focus", COMPOSER_SELECTOR], session, timeout_secs)
@@ -3590,7 +3792,9 @@ if (-not $p -or $p.ProcessName -ne 'chrome') { exit 2 };
         ])
         .output()
         .context("running native Windows Enter submit")?;
-    if !output.status.success() {
+    if let Some(outcome) = native_submit_outcome(output.status.code()) {
+        return Ok(outcome);
+    } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
             "native Windows Enter submit failed (exit {}): {}",
@@ -3598,7 +3802,6 @@ if (-not $p -or $p.ProcessName -ne 'chrome') { exit 2 };
             stderr.trim()
         );
     }
-    Ok(true)
 }
 
 /// Run a chrome-use subcommand with optional profile; return stdout.
@@ -3790,6 +3993,121 @@ fn detect_logged_in_profiles() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn conversation_scan_checks_user_markers_and_refuses_unreadable_records() {
+        let node = ["node", "node.exe", "/mnt/c/Program Files/nodejs/node.exe"]
+            .into_iter()
+            .find(|n| {
+                std::process::Command::new(n)
+                    .arg("--version")
+                    .output()
+                    .is_ok()
+            });
+        let Some(node) = node else {
+            eprintln!("node unavailable; JS fixture skipped");
+            return;
+        };
+        for mode in [
+            "found",
+            "absent",
+            "error",
+            "malformed",
+            "partial",
+            "assistant-only",
+            "wrong-account",
+            "missing-account",
+        ] {
+            let js = super::Channel::request_marker_scan_script(
+                "[request: CREATED]",
+                1,
+                "[\"fixture-user\",\"fixture-account\"]",
+            )
+            .unwrap();
+            let fixture = format!(
+                r#"
+                const mode = {mode:?};
+                let backendCalls = 0;
+                global.fetch = async url => {{
+                    if (url === '/api/auth/session') {{
+                        const claims = {{'https://api.openai.com/auth': mode === 'missing-account' ? {{}} : {{chatgpt_account_id: mode === 'wrong-account' ? 'different-account' : 'fixture-account'}}}};
+                        const token = 'fixture.' + Buffer.from(JSON.stringify(claims)).toString('base64url') + '.signature';
+                        return {{ok: true, json: async () => ({{accessToken: token, user: {{id: 'fixture-user'}}}})}};
+                    }}
+                    backendCalls++;
+                    const data = url.includes('conversations?')
+                      ? {{items: [{{id: 'fixture', update_time: '2026-10-14T00:00:00Z'}}], total: mode === 'partial' ? 2 : 1}}
+                      : mode === 'malformed' ? {{}} : {{mapping: {{a: {{message: {{author: {{role: mode === 'assistant-only' ? 'assistant' : 'user'}}, content: {{parts: [mode === 'absent' || mode === 'partial' ? 'other request' : '[request: CREATED]']}}}}}}}}}};
+                    return {{ok: mode !== 'error', status: 500, json: async () => data}};
+                }};
+                Promise.resolve({js}).then(v => {{const scan=JSON.parse(v); scan.backend_calls=backendCalls; console.log(JSON.stringify(scan));}});
+            "#
+            );
+            let output = std::process::Command::new(node)
+                .args(["-e", &fixture])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let scan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            match mode {
+                "found" => assert_eq!(scan["found"], true),
+                "absent" | "assistant-only" => assert!(crate::receipt::scan_proves_absent(&scan)),
+                // An incomplete listing or unreadable record never proves absence.
+                _ => assert!(!crate::receipt::scan_proves_absent(&scan)),
+            }
+            if mode == "wrong-account" || mode == "missing-account" {
+                assert_eq!(scan["backend_calls"], 0);
+            }
+        }
+    }
+    #[test]
+    fn role_only_and_short_dom_snapshots_keep_waiting() {
+        for text in [
+            "",
+            " ",
+            "ChatGPT a dit :",
+            "ChatGPT said:",
+            "ChatGPT ha dicho:",
+            "ChatGPT hat gesagt:",
+            "ChatGPT disse:",
+            "ChatGPT a dit :          ",
+            "OK",
+        ] {
+            assert!(!super::rendered_reply_has_content(text), "{text:?}");
+        }
+        assert!(super::rendered_reply_has_content(
+            "Here is the completed review verdict."
+        ));
+        // A short real answer is valid when the server, not the DOM, closes it.
+        assert_eq!(
+            super::judge_record(super::ServerTurn {
+                done: true,
+                text: "OK".into(),
+                finish: Some("stop".into()),
+                reason: None
+            })
+            .unwrap(),
+            Some("OK".into())
+        );
+    }
+
+    #[test]
+    fn composer_recheck_distinguishes_empty_missing_and_leftover_text() {
+        for v in [
+            serde_json::json!({}),
+            serde_json::json!({"n":0}),
+            serde_json::json!({"present":false,"n":0}),
+            serde_json::json!({"present":true,"n":8,"text":"leftover"}),
+        ] {
+            assert!(!super::composer_is_empty(&v));
+        }
+        assert!(super::composer_is_empty(
+            &serde_json::json!({"present":true,"n":0,"text":"\n"})
+        ));
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
     static FAKE_BROWSER_SEQ: AtomicU64 = AtomicU64::new(1);
     /// One test, not two: both halves have to move HOME, and cargo runs tests
@@ -4094,10 +4412,38 @@ fi
             pending_project: None,
             submitted: false,
             receipt: None,
+            receipt_searchable: true,
             chat_only: false,
             requested_model: None,
             _surface: SurfaceLock { _file: None },
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plain_existing_ask_failure_preserves_pin_and_excludes_absence_resolution() {
+        let dir = std::env::temp_dir().join(format!("pinned-ask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("request.json");
+        crate::receipt::save(&path, &crate::receipt::Receipt::accepted("existing-ask")).unwrap();
+        let mut channel = fake_channel(PathBuf::from("unused-browser"), None);
+        channel.receipt = Some(path.clone());
+        channel.pin_existing("project-conversation");
+        assert!(!channel.receipt_searchable);
+        // Mimic the plain ask failure envelope, which has no conversation_id.
+        crate::receipt::finish(
+            &path,
+            &serde_json::json!({"status":"incomplete", "error":{"kind":"submit_unknown","submitted":"unknown","message":"no new user turn"}}),
+        );
+        crate::receipt::update(&path, |r| {
+            r.no_user_turn = true;
+            r.request_marker = Some("marker".into());
+            r.submission_account = Some("account".into());
+        });
+        let r = crate::receipt::load(&path).unwrap();
+        assert_eq!(r.conversation_id.as_deref(), Some("project-conversation"));
+        assert!(!crate::receipt::may_resolve_unsent(&r, |_| false));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]
@@ -4375,10 +4721,33 @@ fi
 
     #[test]
     fn github_actions_uses_portable_submit_path() {
-        assert!(!prefer_native_windows_submit(Some("true")));
-        assert!(!prefer_native_windows_submit(Some("TRUE")));
-        assert!(prefer_native_windows_submit(Some("false")));
-        assert!(prefer_native_windows_submit(None));
+        assert!(!prefer_native_windows_submit(Some("true"), Some("native")));
+        assert!(!prefer_native_windows_submit(Some("TRUE"), Some("native")));
+        assert!(!prefer_native_windows_submit(Some("false"), None));
+        assert!(!prefer_native_windows_submit(None, None));
+        assert!(!prefer_native_windows_submit(None, Some("portable")));
+        assert!(prefer_native_windows_submit(None, Some("native")));
+    }
+
+    #[test]
+    fn native_pre_send_guard_is_not_an_ambiguous_submission() {
+        assert_eq!(
+            native_submit_outcome(Some(2)),
+            Some(NativeSubmitOutcome::NotSent)
+        );
+        assert_eq!(
+            native_submit_outcome(Some(0)),
+            Some(NativeSubmitOutcome::Sent)
+        );
+        assert_eq!(native_submit_outcome(Some(1)), None);
+        assert_eq!(native_submit_outcome(None), None);
+        let error = SubmitFailure::BeforeSubmit(
+            ChannelError::new(ErrorKind::NotSubmitted, "no key sent").into(),
+        )
+        .into_error();
+        let channel = error.downcast_ref::<ChannelError>().unwrap();
+        assert_eq!(channel.kind, ErrorKind::NotSubmitted);
+        assert_eq!(channel.submitted, Submitted::No);
     }
 
     #[test]

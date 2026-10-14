@@ -60,6 +60,10 @@ pub struct CancelArgs {
 pub struct ResumeArgs {
     /// The id given to `ask/work --request-id`.
     pub request_id: String,
+    /// Resolve a portable submit with no user turn and no pinned conversation.
+    /// Reads recent conversations; never sends. Older unmarked receipts stay locked.
+    #[arg(long)]
+    pub resolve_unsent: bool,
     /// Validate the reply against this JSON Schema, as `ask --output-schema` does.
     #[arg(long = "output-schema", value_name = "FILE")]
     pub output_schema: Option<String>,
@@ -368,8 +372,14 @@ mod tests {
     #[test]
     fn ask_parser_accepts_chat_only_effort_contract() {
         let cli = Cli::try_parse_from([
-            "chatgpt-use", "ask", "review it", "--chat-only", "--effort", "high",
-        ]).expect("ask chat-only contract should parse");
+            "chatgpt-use",
+            "ask",
+            "review it",
+            "--chat-only",
+            "--effort",
+            "high",
+        ])
+        .expect("ask chat-only contract should parse");
         match cli.command {
             Command::Ask(args) => {
                 assert!(args.chat_only);

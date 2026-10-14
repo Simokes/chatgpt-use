@@ -50,6 +50,9 @@ fn resume(args: &ResumeArgs) -> Value {
             "no",
         );
     };
+    if args.resolve_unsent {
+        return resolve_unsent(args, &path, &r);
+    }
     let convo = match plan(&r, receipt::pid_alive) {
         Ok(convo) => convo,
         Err(envelope) => return envelope,
@@ -93,6 +96,51 @@ fn resume(args: &ResumeArgs) -> Value {
     }
     receipt::finish(&path, &envelope);
     envelope
+}
+
+fn resolve_unsent(args: &ResumeArgs, path: &std::path::Path, r: &Receipt) -> Value {
+    if !receipt::may_resolve_unsent(r, receipt::pid_alive) {
+        return refusal("submission_unknown", "insufficient_evidence", "receipt lacks proof of a portable submit with no user turn and a searchable marker, or still has a live owner", &r.submitted);
+    }
+    // Allow persistence to settle before searching. No keyboard action occurs.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    std::thread::sleep(std::time::Duration::from_secs(
+        10u64.saturating_sub(now.saturating_sub(r.updated_at)),
+    ));
+    let opts = ChannelOptions {
+        profile: args.channel.profile.clone(),
+        session: args.channel.session.clone(),
+        project: String::new(),
+        temporary: false,
+        timeout_secs: args.channel.timeout,
+        model: None,
+        chat_only: false,
+        busy_fail: args.channel.busy == crate::cli::BusyPolicy::Fail,
+        receipt: None,
+    };
+    let resolved = Channel::attach(&opts, "").and_then(|channel| {
+        let scan = channel.scan_request_marker(r.request_marker.as_deref().unwrap(), r.created_at, r.submission_account.as_deref().unwrap())?;
+        let envelope = if receipt::scan_proves_absent(&scan) {
+            receipt::retire_unsent(path, r)?;
+            json!({"status": "failed", "error": {"kind": "not_submitted", "submitted": "no", "message": "request proven unsent; original receipt archived"}, "resolution": scan})
+        } else {
+            // Even a found marker does not authorize a resend. Keep the lock.
+            json!({"status": "submission_unknown", "error": {"kind": "submit_unknown", "submitted": "unknown", "message": "marker found or conversation search incomplete; not retrying"}, "resolution": scan})
+        };
+        channel.close();
+        Ok(envelope)
+    });
+    resolved.unwrap_or_else(|e| {
+        refusal(
+            "submission_unknown",
+            "resolution_failed",
+            &e.to_string(),
+            "unknown",
+        )
+    })
 }
 
 /// What a receipt allows: the conversation to attach to, or the envelope that

@@ -29,6 +29,15 @@ pub struct Receipt {
     /// Stable machine-readable failure kind from the structured envelope.
     pub error_kind: Option<String>,
     pub error: Option<String>,
+    /// Exact marker embedded in the submitted user text (older receipts lack it).
+    #[serde(default)]
+    pub request_marker: Option<String>,
+    /// Portable submit completed its observation window without a new user turn.
+    #[serde(default)]
+    pub no_user_turn: bool,
+    /// User + ChatGPT account identity observed immediately before submission.
+    #[serde(default)]
+    pub submission_account: Option<String>,
 }
 
 impl Receipt {
@@ -45,6 +54,9 @@ impl Receipt {
             outcome: None,
             error_kind: None,
             error: None,
+            request_marker: None,
+            no_user_turn: false,
+            submission_account: None,
         }
     }
 }
@@ -163,6 +175,44 @@ pub fn may_send(existing: Option<&Receipt>) -> bool {
     }
 }
 
+/// Only this transport evidence permits a read-only search to retire a lock.
+pub fn may_resolve_unsent(r: &Receipt, alive: impl Fn(u32) -> bool) -> bool {
+    r.state == "failed"
+        && r.submitted == "unknown"
+        && r.conversation_id.is_none()
+        && r.error_kind.as_deref() == Some("submit_unknown")
+        && r.no_user_turn
+        && r.request_marker.as_ref().is_some_and(|m| !m.is_empty())
+        && r.submission_account.as_ref().is_some_and(|a| !a.is_empty())
+        && !alive(r.pid)
+}
+
+pub fn scan_proves_absent(scan: &serde_json::Value) -> bool {
+    scan["ok"] == true && scan["found"] == false && scan["complete"] == true
+}
+
+/// Preserve the ambiguous original, then atomically replace it with the proof.
+/// Keeping the id terminal lets AgentReview advance to -rN without recycling it.
+pub fn retire_unsent(path: &Path, original: &Receipt) -> std::io::Result<()> {
+    if load(path).as_ref() != Some(original) {
+        return Err(std::io::Error::other("receipt changed during resolution"));
+    }
+    let archive = path.with_extension(format!(
+        "proven-unsent.{}.{}.json",
+        now(),
+        std::process::id()
+    ));
+    if !create(&archive, original)? {
+        return Err(std::io::Error::other("receipt archive already exists"));
+    }
+    let mut retired = original.clone();
+    retired.submitted = "no".into();
+    retired.updated_at = now();
+    retired.error_kind = Some("not_submitted".into());
+    retired.error = Some("portable submit observed no user turn; complete recent-conversation scan found no request marker".into());
+    save(path, &retired)
+}
+
 /// The state `status` reports. A receipt still marked in-flight is resolved
 /// by whether its owner is alive: a dead owner that never recorded a
 /// submission may still have pressed Enter, which is `submission_unknown` —
@@ -197,6 +247,74 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsent_resolution_requires_all_transport_evidence_and_no_live_owner() {
+        let mut r = Receipt::accepted("resolve");
+        r.state = "failed".into();
+        r.submitted = "unknown".into();
+        r.error_kind = Some("submit_unknown".into());
+        r.no_user_turn = true;
+        r.request_marker = Some("[chatgpt-use request-id: resolve]".into());
+        r.submission_account = Some("[\"user-A\",\"account-A\"]".into());
+        assert!(may_resolve_unsent(&r, |_| false));
+        assert!(!may_resolve_unsent(&r, |_| true));
+        for change in 0..7 {
+            let mut bad = r.clone();
+            match change {
+                0 => bad.conversation_id = Some("pinned".into()),
+                1 => bad.request_marker = None,
+                2 => bad.no_user_turn = false,
+                3 => bad.submitted = "yes".into(),
+                4 => bad.state = "accepted".into(),
+                5 => bad.submission_account = None,
+                _ => bad.error_kind = Some("timeout".into()),
+            }
+            assert!(!may_resolve_unsent(&bad, |_| false));
+        }
+    }
+
+    #[test]
+    fn found_markers_and_incomplete_or_failed_searches_keep_the_lock() {
+        for scan in [
+            serde_json::json!({}),
+            serde_json::json!({"ok":false}),
+            serde_json::json!({"ok":true,"found":true,"complete":true}),
+            serde_json::json!({"ok":true,"found":false}),
+        ] {
+            assert!(!scan_proves_absent(&scan));
+        }
+        assert!(scan_proves_absent(
+            &serde_json::json!({"ok":true,"found":false,"complete":true})
+        ));
+    }
+
+    #[test]
+    fn retirement_archives_the_original_and_does_not_overwrite_a_changed_receipt() {
+        let dir = std::env::temp_dir().join(format!("receipt-retire-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("resolve.json");
+        let mut r = Receipt::accepted("resolve");
+        r.state = "failed".into();
+        r.submitted = "unknown".into();
+        save(&path, &r).unwrap();
+        retire_unsent(&path, &r).unwrap();
+        let retired = load(&path).unwrap();
+        assert_eq!(retired.submitted, "no");
+        assert_eq!(retired.state, "failed");
+        let archives: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p != path).then_some(p)
+            })
+            .collect();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(load(&archives[0]), Some(r.clone()));
+        assert!(retire_unsent(&path, &r).is_err());
+        assert_eq!(load(&path), Some(retired));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn ids_are_restricted_to_a_file_safe_alphabet() {

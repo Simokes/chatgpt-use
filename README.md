@@ -1,5 +1,15 @@
 # chatgpt-use
 
+### AgentReview submit transport
+
+Browser submission is portable by default, for both manual Windows/WSL launches
+and GitHub Actions. It verifies a new user turn before declaring the prompt sent.
+`CHATGPT_USE_SUBMIT_TRANSPORT=native` explicitly opts into Windows foreground
+`SendKeys` outside CI; AgentReview always supplies `portable` to its subprocess.
+The native foreground guard's exit 2 means no key was sent and is reported as
+`not_submitted/submitted=no`. Errors after a possible key dispatch remain
+ambiguous and must not automatically resend the prompt.
+
 > Turn your **ChatGPT web subscription** into a coding-agent backend — **no API key, no Codex billing.**
 > Built on [`chrome-use`](https://github.com/leeguooooo/chrome-use), same lineage as [`chatgpt-imagegen`](https://github.com/leeguooooo/chatgpt-imagegen) and [`cookie-use`](https://github.com/leeguooooo/cookie-use).
 
