@@ -492,6 +492,29 @@ const __cguToken = async () => {
 };
 "#;
 
+// Fetch current credentials freshly: a cached bearer from another login is
+// not proof of the account presently used by the submission surface. Return
+// only the stable user/account identity to Rust, never the bearer itself.
+const JS_ACCOUNT_PRELUDE: &str = r#"
+const __cguAccount = async () => {
+  const response = await fetch('/api/auth/session', {credentials: 'include', cache: 'no-store'});
+  if (!response.ok) throw new Error('account identity unavailable');
+  const s = await response.json();
+  const token = s && s.accessToken;
+  if (typeof token !== 'string') throw new Error('account token unavailable');
+  const encoded = token.split('.')[1];
+  if (!encoded) throw new Error('account claims unavailable');
+  const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+  const claims = JSON.parse(atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, '=')));
+  const auth = claims['https://api.openai.com/auth'];
+  const user = s.user && s.user.id;
+  const account = auth && auth.chatgpt_account_id;
+  if (typeof user !== 'string' || !user || typeof account !== 'string' || !account)
+    throw new Error('stable user/account identity unavailable');
+  return {token, identity: JSON.stringify([user, account])};
+};
+"#;
+
 /// JS: ask the SERVER whether this turn is finished, and what it said.
 ///
 /// The DOM can only be inferred from: we watch it stop changing and call that an
@@ -1597,6 +1620,23 @@ impl Channel {
             .map_err(SubmitFailure::BeforeSubmit)?;
         self.fill_composer(message, budget)
             .map_err(SubmitFailure::BeforeSubmit)?;
+        if self.receipt.is_some()
+            && self.receipt_searchable
+            && self.convo_id.is_none()
+            && self.project.is_empty()
+        {
+            let js = format!(
+                r#"(async () => {{ {JS_ACCOUNT_PRELUDE}
+                try {{ const a = await __cguAccount(); return JSON.stringify({{account: a.identity}}); }}
+                catch (_) {{ return JSON.stringify({{}}); }} }})()"#
+            );
+            let account = ab_eval(&self.ab, &js, &self.session, budget)
+                .ok()
+                .and_then(|v| v["account"].as_str().map(str::to_string));
+            if let Some(path) = &self.receipt {
+                crate::receipt::update(path, |r| r.submission_account = account);
+            }
+        }
         self.submit(baseline_users, budget)
     }
 
@@ -2070,7 +2110,7 @@ impl Channel {
         let plain = existing_conversation_connect_options(opts);
         let mut chan = Channel::connect_with(&plain, false)?;
         chan.project = opts.project.trim().to_string();
-        chan.convo_id = Some(convo_id.trim().to_string());
+        chan.pin_existing(convo_id);
         chan.submitted = false;
         let budget = opts.timeout_secs.min(90).max(20) as f64;
         chan.chat_only = opts.chat_only;
@@ -2082,6 +2122,14 @@ impl Channel {
             )
         })?;
         Ok(chan)
+    }
+
+    fn pin_existing(&mut self, convo_id: &str) {
+        self.convo_id = Some(convo_id.trim().to_string());
+        // Membership of an existing chat is not established by --project.
+        // Exclude every existing target from unpinned absence resolution.
+        self.receipt_searchable = false;
+        self.touch_receipt();
     }
 
     /// Attach to an existing conversation to read its reply, without typing.
@@ -2814,17 +2862,23 @@ impl Channel {
 
     /// Read every conversation updated since this request was created. Missing
     /// pages/records, malformed timestamps and scan limits all remain unknown.
-    pub fn scan_request_marker(&self, marker: &str, created_at: u64) -> Result<serde_json::Value> {
-        let js = Self::request_marker_scan_script(marker, created_at)?;
+    pub fn scan_request_marker(
+        &self,
+        marker: &str,
+        created_at: u64,
+        account: &str,
+    ) -> Result<serde_json::Value> {
+        let js = Self::request_marker_scan_script(marker, created_at, account)?;
         ab_eval(&self.ab, &js, &self.session, self.timeout_secs as f64)
     }
 
-    fn request_marker_scan_script(marker: &str, created_at: u64) -> Result<String> {
+    fn request_marker_scan_script(marker: &str, created_at: u64, account: &str) -> Result<String> {
         let script = r#"(async () => {
           PRELUDE
           try {
-            const tok = await __cguToken();
-            if (!tok) throw new Error('not signed in');
+            const current = await __cguAccount();
+            if (current.identity !== ACCOUNT) throw new Error('submission account mismatch');
+            const tok = current.token;
             const get = async url => {
               const r = await fetch(url, {credentials: 'include', headers: {Authorization: 'Bearer ' + tok}});
               if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -2862,8 +2916,9 @@ impl Channel {
           } catch(e) { return JSON.stringify({ok: false, error: String(e)}); }
         })()"#;
         let js = script
-            .replace("PRELUDE", JS_TOKEN_PRELUDE)
+            .replace("PRELUDE", JS_ACCOUNT_PRELUDE)
             .replace("CREATED", &created_at.to_string())
+            .replace("ACCOUNT", &serde_json::to_string(account)?)
             .replace("MARKER", &serde_json::to_string(marker)?);
         Ok(js)
     }
@@ -3959,19 +4014,32 @@ mod tests {
             "malformed",
             "partial",
             "assistant-only",
+            "wrong-account",
+            "missing-account",
         ] {
-            let js = super::Channel::request_marker_scan_script("[request: CREATED]", 1).unwrap();
+            let js = super::Channel::request_marker_scan_script(
+                "[request: CREATED]",
+                1,
+                "[\"fixture-user\",\"fixture-account\"]",
+            )
+            .unwrap();
             let fixture = format!(
                 r#"
                 const mode = {mode:?};
-                global.window = {{__cguTok: {{token: 'fixture', until: Date.now()+60000}}}};
+                let backendCalls = 0;
                 global.fetch = async url => {{
+                    if (url === '/api/auth/session') {{
+                        const claims = {{'https://api.openai.com/auth': mode === 'missing-account' ? {{}} : {{chatgpt_account_id: mode === 'wrong-account' ? 'different-account' : 'fixture-account'}}}};
+                        const token = 'fixture.' + Buffer.from(JSON.stringify(claims)).toString('base64url') + '.signature';
+                        return {{ok: true, json: async () => ({{accessToken: token, user: {{id: 'fixture-user'}}}})}};
+                    }}
+                    backendCalls++;
                     const data = url.includes('conversations?')
                       ? {{items: [{{id: 'fixture', update_time: '2026-10-14T00:00:00Z'}}], total: mode === 'partial' ? 2 : 1}}
                       : mode === 'malformed' ? {{}} : {{mapping: {{a: {{message: {{author: {{role: mode === 'assistant-only' ? 'assistant' : 'user'}}, content: {{parts: [mode === 'absent' || mode === 'partial' ? 'other request' : '[request: CREATED]']}}}}}}}}}};
                     return {{ok: mode !== 'error', status: 500, json: async () => data}};
                 }};
-                Promise.resolve({js}).then(console.log);
+                Promise.resolve({js}).then(v => {{const scan=JSON.parse(v); scan.backend_calls=backendCalls; console.log(JSON.stringify(scan));}});
             "#
             );
             let output = std::process::Command::new(node)
@@ -3989,6 +4057,9 @@ mod tests {
                 "absent" | "assistant-only" => assert!(crate::receipt::scan_proves_absent(&scan)),
                 // An incomplete listing or unreadable record never proves absence.
                 _ => assert!(!crate::receipt::scan_proves_absent(&scan)),
+            }
+            if mode == "wrong-account" || mode == "missing-account" {
+                assert_eq!(scan["backend_calls"], 0);
             }
         }
     }
@@ -4346,6 +4417,33 @@ fi
             requested_model: None,
             _surface: SurfaceLock { _file: None },
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plain_existing_ask_failure_preserves_pin_and_excludes_absence_resolution() {
+        let dir = std::env::temp_dir().join(format!("pinned-ask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("request.json");
+        crate::receipt::save(&path, &crate::receipt::Receipt::accepted("existing-ask")).unwrap();
+        let mut channel = fake_channel(PathBuf::from("unused-browser"), None);
+        channel.receipt = Some(path.clone());
+        channel.pin_existing("project-conversation");
+        assert!(!channel.receipt_searchable);
+        // Mimic the plain ask failure envelope, which has no conversation_id.
+        crate::receipt::finish(
+            &path,
+            &serde_json::json!({"status":"incomplete", "error":{"kind":"submit_unknown","submitted":"unknown","message":"no new user turn"}}),
+        );
+        crate::receipt::update(&path, |r| {
+            r.no_user_turn = true;
+            r.request_marker = Some("marker".into());
+            r.submission_account = Some("account".into());
+        });
+        let r = crate::receipt::load(&path).unwrap();
+        assert_eq!(r.conversation_id.as_deref(), Some("project-conversation"));
+        assert!(!crate::receipt::may_resolve_unsent(&r, |_| false));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]

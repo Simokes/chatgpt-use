@@ -35,6 +35,9 @@ pub struct Receipt {
     /// Portable submit completed its observation window without a new user turn.
     #[serde(default)]
     pub no_user_turn: bool,
+    /// User + ChatGPT account identity observed immediately before submission.
+    #[serde(default)]
+    pub submission_account: Option<String>,
 }
 
 impl Receipt {
@@ -53,6 +56,7 @@ impl Receipt {
             error: None,
             request_marker: None,
             no_user_turn: false,
+            submission_account: None,
         }
     }
 }
@@ -179,6 +183,7 @@ pub fn may_resolve_unsent(r: &Receipt, alive: impl Fn(u32) -> bool) -> bool {
         && r.error_kind.as_deref() == Some("submit_unknown")
         && r.no_user_turn
         && r.request_marker.as_ref().is_some_and(|m| !m.is_empty())
+        && r.submission_account.as_ref().is_some_and(|a| !a.is_empty())
         && !alive(r.pid)
 }
 
@@ -251,9 +256,10 @@ mod tests {
         r.error_kind = Some("submit_unknown".into());
         r.no_user_turn = true;
         r.request_marker = Some("[chatgpt-use request-id: resolve]".into());
+        r.submission_account = Some("[\"user-A\",\"account-A\"]".into());
         assert!(may_resolve_unsent(&r, |_| false));
         assert!(!may_resolve_unsent(&r, |_| true));
-        for change in 0..6 {
+        for change in 0..7 {
             let mut bad = r.clone();
             match change {
                 0 => bad.conversation_id = Some("pinned".into()),
@@ -261,6 +267,7 @@ mod tests {
                 2 => bad.no_user_turn = false,
                 3 => bad.submitted = "yes".into(),
                 4 => bad.state = "accepted".into(),
+                5 => bad.submission_account = None,
                 _ => bad.error_kind = Some("timeout".into()),
             }
             assert!(!may_resolve_unsent(&bad, |_| false));

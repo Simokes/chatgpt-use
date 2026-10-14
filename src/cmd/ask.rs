@@ -189,7 +189,10 @@ fn claim_receipt(args: &AskArgs) -> Result<Option<PathBuf>> {
         );
     }
     let path = receipt::path_for(id);
-    let fresh = receipt::Receipt::accepted(id);
+    let mut fresh = receipt::Receipt::accepted(id);
+    // A known target is a pin even when connect/send fails before the channel
+    // can observe a new user turn. Plain ask errors must not erase that fact.
+    fresh.conversation_id = args.conversation_id.clone();
     if receipt::create(&path, &fresh)
         .with_context(|| format!("could not write receipt {}", path.display()))?
     {

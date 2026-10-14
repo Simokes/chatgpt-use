@@ -122,7 +122,7 @@ fn resolve_unsent(args: &ResumeArgs, path: &std::path::Path, r: &Receipt) -> Val
         receipt: None,
     };
     let resolved = Channel::attach(&opts, "").and_then(|channel| {
-        let scan = channel.scan_request_marker(r.request_marker.as_deref().unwrap(), r.created_at)?;
+        let scan = channel.scan_request_marker(r.request_marker.as_deref().unwrap(), r.created_at, r.submission_account.as_deref().unwrap())?;
         let envelope = if receipt::scan_proves_absent(&scan) {
             receipt::retire_unsent(path, r)?;
             json!({"status": "failed", "error": {"kind": "not_submitted", "submitted": "no", "message": "request proven unsent; original receipt archived"}, "resolution": scan})
