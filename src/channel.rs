@@ -438,7 +438,7 @@ const JS_DISMISS_DIALOG: &str = r#"(() => {
 // both sides can compute identically.
 const JS_COMPOSER_FINGERPRINT: &str = r#"(() => {
   const c = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]');
-  const t = c ? (c.innerText || c.textContent || '') : '';
+  const t = c ? (c.value ?? c.innerText ?? c.textContent ?? '') : '';
   const isWs = (u) =>
     (u >= 0x09 && u <= 0x0d) || u === 0x20 || u === 0x85 || u === 0xa0 ||
     u === 0x1680 || (u >= 0x2000 && u <= 0x200a) || u === 0x2028 ||
@@ -454,7 +454,7 @@ const JS_COMPOSER_FINGERPRINT: &str = r#"(() => {
     h = (h ^ (u >>> 8)) >>> 0;
     h = Math.imul(h, 0x01000193) >>> 0;
   }
-  return JSON.stringify({n: n, h: h});
+  return JSON.stringify({present: !!c, text: t, n: n, h: h});
 })()"#;
 
 /// A JS prelude every backend call shares: fetch the page's bearer token ONCE
@@ -1670,9 +1670,8 @@ impl Channel {
                 budget,
             );
             if ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget)
-                .ok()
-                .and_then(|v| v.get("n").and_then(|n| n.as_u64()))
-                == Some(0)
+                .as_ref()
+                .is_ok_and(composer_is_empty)
             {
                 cleared = true;
                 break;
@@ -1680,10 +1679,14 @@ impl Channel {
             std::thread::sleep(Duration::from_millis(300));
         }
         if !cleared {
-            bail!(
-                "could not empty the ChatGPT composer — leftover text would be \
-                 prepended to the message"
-            );
+            // Draft hydration can race the native clear. Read once more after
+            // settling, without another write, before refusing a safe submit.
+            std::thread::sleep(Duration::from_millis(500));
+            let observed = ab_eval(&self.ab, JS_COMPOSER_FINGERPRINT, &self.session, budget);
+            eprintln!("composer clear re-check: {observed:?}");
+            if !observed.as_ref().is_ok_and(composer_is_empty) {
+                bail!("could not empty the ChatGPT composer — leftover text would be prepended to the message; observed {observed:?}");
+            }
         }
 
         // Let chrome-use perform the editor-specific write through its native
@@ -1788,6 +1791,9 @@ impl Channel {
                 );
             }
             if !self.await_user_turn(baseline_users, Duration::from_secs(5), budget) {
+                if let Some(path) = &self.receipt {
+                    crate::receipt::update(path, |r| r.no_user_turn = true);
+                }
                 return Err(SubmitFailure::Ambiguous(anyhow!(
                     "the message was never submitted — no new user turn appeared after the portable submit path"
                 )));
@@ -2235,6 +2241,15 @@ impl Channel {
     }
 
     fn send_turn(&mut self, message: &str, sopts: &SendOptions) -> Result<String> {
+        // Persist the exact search key before any possible send. A receipt
+        // without this key can never be proven unsent by a marker search.
+        let marked_message = self.receipt.as_ref().and_then(|path| {
+            let r = crate::receipt::load(path)?;
+            let marker = format!("[chatgpt-use request-id: {}]", r.request_id);
+            crate::receipt::update(path, |r| r.request_marker = Some(marker.clone()));
+            Some(format!("{message}\n\n{marker}"))
+        });
+        let message = marked_message.as_deref().unwrap_or(message);
         let deadline = Instant::now() + Duration::from_secs(self.timeout_secs);
 
         let remaining_secs = || {
@@ -2650,6 +2665,12 @@ impl Channel {
                 continue;
             }
 
+            if !rendered_reply_has_content(&atext) {
+                idle_count = 0;
+                stable_polls = 0;
+                continue;
+            }
+
             // We only reach here with the stop button GONE and no tool active —
             // i.e. generation has actually ended (a genuine mid-stream gap keeps
             // `stop` true, so we `continue` above and never land here). Fast path:
@@ -2665,7 +2686,7 @@ impl Channel {
             // poll — stop button absent, previous reply static — and we scrape
             // the PREVIOUS turn's text and return it as this turn's answer.
             // Fail closed: no new turn means we keep waiting, then time out.
-            if cur_count > baseline_count {
+            if cur_count > baseline_count && rendered_reply_has_content(&atext) {
                 if !atext.is_empty() && atext == prev_stable {
                     stable_polls += 1;
                     if stable_polls >= stable_needed {
@@ -2707,6 +2728,10 @@ impl Channel {
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| last_atext.clone());
+
+        if !rendered_reply_has_content(&reply_text) {
+            return self.await_record();
+        }
 
         self.finish_turn(reply_text, remaining_secs())
     }
@@ -2778,6 +2803,62 @@ impl Channel {
     pub fn eval(&self, js: &str) -> Result<serde_json::Value> {
         let t = (self.timeout_secs.min(30) as f64).max(5.0);
         ab_eval(&self.ab, js, &self.session, t)
+    }
+
+    /// Read every conversation updated since this request was created. Missing
+    /// pages/records, malformed timestamps and scan limits all remain unknown.
+    pub fn scan_request_marker(&self, marker: &str, created_at: u64) -> Result<serde_json::Value> {
+        let js = Self::request_marker_scan_script(marker, created_at)?;
+        ab_eval(&self.ab, &js, &self.session, self.timeout_secs as f64)
+    }
+
+    fn request_marker_scan_script(marker: &str, created_at: u64) -> Result<String> {
+        let script = r#"(async () => {
+          PRELUDE
+          try {
+            const tok = await __cguToken();
+            if (!tok) throw new Error('not signed in');
+            const get = async url => {
+              const r = await fetch(url, {credentials: 'include', headers: {Authorization: 'Bearer ' + tok}});
+              if (!r.ok) throw new Error('HTTP ' + r.status);
+              return await r.json();
+            };
+            const marker = MARKER;
+            const cutoff = CREATED * 1000 - 60000;
+            let checked = 0;
+            for (let offset = 0; offset < 1000; offset += 100) {
+              const page = await get('/backend-api/conversations?offset=' + offset + '&limit=100&order=updated');
+              if (!Array.isArray(page.items) || !Number.isInteger(page.total) || page.total < 0)
+                throw new Error('invalid conversation listing');
+              for (const item of page.items) {
+                const updated = Date.parse(item.update_time);
+                if (!item.id || !Number.isFinite(updated)) throw new Error('invalid conversation metadata');
+                if (updated < cutoff) continue;
+                const record = await get('/backend-api/conversation/' + encodeURIComponent(item.id));
+                if (!record.mapping || typeof record.mapping !== 'object') throw new Error('missing conversation mapping');
+                checked++;
+                for (const node of Object.values(record.mapping)) {
+                  const m = node && node.message;
+                  if (m && m.author && m.author.role === 'user') {
+                    const parts = m.content && m.content.parts;
+                    if (!Array.isArray(parts)) throw new Error('unreadable user message');
+                    if (parts.some(p => typeof p === 'string' && p.includes(marker)))
+                      return JSON.stringify({ok: true, found: true, conversation_id: item.id, checked});
+                  }
+                }
+              }
+              if (offset + page.items.length >= page.total)
+                return JSON.stringify({ok: true, found: false, complete: true, checked});
+              if (page.items.length !== 100) throw new Error('incomplete conversation page');
+            }
+            throw new Error('conversation scan limit reached');
+          } catch(e) { return JSON.stringify({ok: false, error: String(e)}); }
+        })()"#;
+        let js = script
+            .replace("PRELUDE", JS_TOKEN_PRELUDE)
+            .replace("MARKER", &serde_json::to_string(marker)?)
+            .replace("CREATED", &created_at.to_string());
+        Ok(js)
     }
 
     /// Navigate the open session into the named ChatGPT Project, creating it on
@@ -3208,6 +3289,36 @@ struct ServerTurn {
 /// so it is an incomplete turn, never a reply. Only KNOWN cut-offs count
 /// against a reply; an unrecognised finish type passes as a normal finish, so
 /// a model that labels its stop differently keeps working.
+fn composer_is_empty(v: &serde_json::Value) -> bool {
+    v.get("present").and_then(|v| v.as_bool()) == Some(true)
+        && v.get("n").and_then(|v| v.as_u64()) == Some(0)
+}
+
+// DOM text may consist solely of a localized role heading, before any tokens
+// arrive. Very short DOM text is also provisional; short real answers remain
+// valid when the authoritative server record closes the turn.
+fn rendered_reply_has_content(text: &str) -> bool {
+    let text = text.trim();
+    if text.chars().count() < 24 {
+        return false;
+    }
+    if text.to_lowercase().starts_with("chatgpt")
+        && text.ends_with([':', '：'])
+        && !text.contains('\n')
+        && text.chars().count() < 100
+    {
+        return false;
+    }
+    !text
+        .trim_end_matches([':', '：', ' '])
+        .trim()
+        .eq_ignore_ascii_case("ChatGPT said")
+        && !text
+            .trim_end_matches([':', '：', ' '])
+            .trim()
+            .eq_ignore_ascii_case("ChatGPT a dit")
+}
+
 fn judge_record(turn: ServerTurn) -> Result<Option<String>> {
     match turn.finish.as_deref() {
         Some(kind @ ("interrupted" | "max_tokens")) => {
@@ -3820,6 +3931,106 @@ fn detect_logged_in_profiles() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn conversation_scan_checks_user_markers_and_refuses_unreadable_records() {
+        let node = ["node", "node.exe", "/mnt/c/Program Files/nodejs/node.exe"]
+            .into_iter()
+            .find(|n| {
+                std::process::Command::new(n)
+                    .arg("--version")
+                    .output()
+                    .is_ok()
+            });
+        let Some(node) = node else {
+            eprintln!("node unavailable; JS fixture skipped");
+            return;
+        };
+        for mode in [
+            "found",
+            "absent",
+            "error",
+            "malformed",
+            "partial",
+            "assistant-only",
+        ] {
+            let js = super::Channel::request_marker_scan_script("[request: test]", 1).unwrap();
+            let fixture = format!(
+                r#"
+                const mode = {mode:?};
+                global.window = {{__cguTok: {{token: 'fixture', until: Date.now()+60000}}}};
+                global.fetch = async url => {{
+                    const data = url.includes('conversations?')
+                      ? {{items: [{{id: 'fixture', update_time: '2026-10-14T00:00:00Z'}}], total: mode === 'partial' ? 2 : 1}}
+                      : mode === 'malformed' ? {{}} : {{mapping: {{a: {{message: {{author: {{role: mode === 'assistant-only' ? 'assistant' : 'user'}}, content: {{parts: [mode === 'absent' ? 'other request' : '[request: test]']}}}}}}}}}};
+                    return {{ok: mode !== 'error', status: 500, json: async () => data}};
+                }};
+                Promise.resolve({js}).then(console.log);
+            "#
+            );
+            let output = std::process::Command::new(node)
+                .args(["-e", &fixture])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let scan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            match mode {
+                "found" => assert_eq!(scan["found"], true),
+                "absent" | "assistant-only" => assert!(crate::receipt::scan_proves_absent(&scan)),
+                // Partial listing includes a marker: even then it must block,
+                // and must never return an absence proof.
+                _ => assert!(!crate::receipt::scan_proves_absent(&scan)),
+            }
+        }
+    }
+    #[test]
+    fn role_only_and_short_dom_snapshots_keep_waiting() {
+        for text in [
+            "",
+            " ",
+            "ChatGPT a dit :",
+            "ChatGPT said:",
+            "ChatGPT ha dicho:",
+            "ChatGPT hat gesagt:",
+            "ChatGPT disse:",
+            "ChatGPT a dit :          ",
+            "OK",
+        ] {
+            assert!(!super::rendered_reply_has_content(text), "{text:?}");
+        }
+        assert!(super::rendered_reply_has_content(
+            "Here is the completed review verdict."
+        ));
+        // A short real answer is valid when the server, not the DOM, closes it.
+        assert_eq!(
+            super::judge_record(super::ServerTurn {
+                done: true,
+                text: "OK".into(),
+                finish: Some("stop".into()),
+                reason: None
+            })
+            .unwrap(),
+            Some("OK".into())
+        );
+    }
+
+    #[test]
+    fn composer_recheck_distinguishes_empty_missing_and_leftover_text() {
+        for v in [
+            serde_json::json!({}),
+            serde_json::json!({"n":0}),
+            serde_json::json!({"present":false,"n":0}),
+            serde_json::json!({"present":true,"n":8,"text":"leftover"}),
+        ] {
+            assert!(!super::composer_is_empty(&v));
+        }
+        assert!(super::composer_is_empty(
+            &serde_json::json!({"present":true,"n":0,"text":"\n"})
+        ));
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
     static FAKE_BROWSER_SEQ: AtomicU64 = AtomicU64::new(1);
     /// One test, not two: both halves have to move HOME, and cargo runs tests
