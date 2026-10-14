@@ -3987,8 +3987,7 @@ mod tests {
             match mode {
                 "found" => assert_eq!(scan["found"], true),
                 "absent" | "assistant-only" => assert!(crate::receipt::scan_proves_absent(&scan)),
-                // Partial listing includes a marker: even then it must block,
-                // and must never return an absence proof.
+                // An incomplete listing or unreadable record never proves absence.
                 _ => assert!(!crate::receipt::scan_proves_absent(&scan)),
             }
         }
