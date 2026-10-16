@@ -2868,8 +2868,82 @@ impl Channel {
         created_at: u64,
         account: &str,
     ) -> Result<serde_json::Value> {
-        let js = Self::request_marker_scan_script(marker, created_at, account)?;
-        ab_eval(&self.ab, &js, &self.session, self.timeout_secs as f64)
+        // A complete history scan can outlive the relay's per-evaluation
+        // deadline (8s). Start it without awaiting its promise; short polls
+        // retain the channel's total budget and the existing absence proof.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let key = format!("__cgu_receipt_scan_{}_{}", std::process::id(), nonce);
+        let scan = Self::request_marker_scan_script(marker, created_at, account)?;
+        let start = Self::request_marker_scan_start_script(&key, &scan)?;
+        let poll = Self::request_marker_scan_poll_script(&key)?;
+        let cleanup = Self::request_marker_scan_cleanup_script(&key)?;
+        let deadline = Instant::now() + Duration::from_secs(self.timeout_secs);
+        let result = (|| {
+            let started = ab_eval(&self.ab, &start, &self.session, self.timeout_secs as f64)?;
+            if started["started"] != true {
+                bail!("request marker scan did not start");
+            }
+            loop {
+                let remaining = deadline.checked_duration_since(Instant::now())
+                    .ok_or_else(|| anyhow!("request marker scan exceeded its total time budget"))?;
+                let state = ab_eval(&self.ab, &poll, &self.session, remaining.as_secs_f64())?;
+                match Self::request_marker_scan_result(state)? {
+                    Some(value) => return Ok(value),
+                    None => std::thread::sleep(Duration::from_millis(250).min(remaining)),
+                }
+            }
+        })();
+        // Abort outstanding fetches on timeout/error and remove only our job.
+        // The async task retains the detached object, never recreates its key.
+        let _ = ab_eval(&self.ab, &cleanup, &self.session, 5.0);
+        result
+    }
+
+    fn request_marker_scan_start_script(key: &str, scan: &str) -> Result<String> {
+        let key = serde_json::to_string(key)?;
+        Ok(format!(r#"(() => {{
+            const key = {key};
+            const controller = new AbortController();
+            const job = {{done: false, cancel: () => controller.abort()}};
+            globalThis[key] = job;
+            const fetch = (url, options = {{}}) => globalThis.fetch(url, {{...options, signal: controller.signal}});
+            Promise.resolve().then(() => {scan}).then(value => {{
+                job.result = JSON.parse(value);
+                job.done = true;
+            }}, () => {{
+                job.result = {{ok: false, error: 'request marker scan failed'}};
+                job.done = true;
+            }});
+            return JSON.stringify({{started: true}});
+        }})()"#))
+    }
+
+    fn request_marker_scan_poll_script(key: &str) -> Result<String> {
+        let key = serde_json::to_string(key)?;
+        Ok(format!(r#"(() => {{
+            const job = globalThis[{key}];
+            return JSON.stringify(job ? {{done: job.done, result: job.result}} : {{missing: true}});
+        }})()"#))
+    }
+
+    fn request_marker_scan_cleanup_script(key: &str) -> Result<String> {
+        let key = serde_json::to_string(key)?;
+        Ok(format!(r#"(() => {{
+            const job = globalThis[{key}];
+            if (job) job.cancel();
+            delete globalThis[{key}];
+            return JSON.stringify({{cleaned: true}});
+        }})()"#))
+    }
+
+    fn request_marker_scan_result(state: serde_json::Value) -> Result<Option<serde_json::Value>> {
+        match state["done"].as_bool() {
+            Some(false) => Ok(None),
+            Some(true) if state["result"].is_object() => Ok(Some(state["result"].clone())),
+            _ => bail!("request marker scan state is missing or malformed; submission remains unknown"),
+        }
     }
 
     fn request_marker_scan_script(marker: &str, created_at: u64, account: &str) -> Result<String> {
@@ -2887,14 +2961,22 @@ impl Channel {
             const marker = MARKER;
             const cutoff = CREATED * 1000 - 60000;
             let checked = 0;
+            let previousUpdate = Infinity;
             for (let offset = 0; offset < 1000; offset += 100) {
               const page = await get('/backend-api/conversations?offset=' + offset + '&limit=100&order=updated');
               if (!Array.isArray(page.items) || !Number.isInteger(page.total) || page.total < 0)
                 throw new Error('invalid conversation listing');
+              const exhausted = offset + page.items.length >= page.total;
+              if (!exhausted && page.items.length !== 100) throw new Error('incomplete conversation page');
+              let crossedCutoff = false;
               for (const item of page.items) {
                 const updated = Date.parse(item.update_time);
                 if (!item.id || !Number.isFinite(updated)) throw new Error('invalid conversation metadata');
-                if (updated < cutoff) continue;
+                // The endpoint is explicitly requested in descending update
+                // order. Verify it before using the time boundary as proof.
+                if (updated > previousUpdate) throw new Error('conversation listing is not ordered by update time');
+                previousUpdate = updated;
+                if (updated < cutoff) { crossedCutoff = true; continue; }
                 const record = await get('/backend-api/conversation/' + encodeURIComponent(item.id));
                 if (!record.mapping || typeof record.mapping !== 'object') throw new Error('missing conversation mapping');
                 checked++;
@@ -2908,9 +2990,8 @@ impl Channel {
                   }
                 }
               }
-              if (offset + page.items.length >= page.total)
+              if (exhausted || crossedCutoff)
                 return JSON.stringify({ok: true, found: false, complete: true, checked});
-              if (page.items.length !== 100) throw new Error('incomplete conversation page');
             }
             throw new Error('conversation scan limit reached');
           } catch(e) { return JSON.stringify({ok: false, error: String(e)}); }
@@ -3994,6 +4075,67 @@ fn detect_logged_in_profiles() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn receipt_scan_poll_never_treats_a_missing_or_pending_job_as_absent() {
+        use serde_json::json;
+        assert!(super::Channel::request_marker_scan_result(json!({"done": false})).unwrap().is_none());
+        for state in [json!({"missing": true}), json!({}), json!({"done": true}), json!({"done": true, "result": null})] {
+            assert!(super::Channel::request_marker_scan_result(state).is_err());
+        }
+        let found = json!({"ok": true, "found": true, "conversation_id": "fixture"});
+        assert_eq!(super::Channel::request_marker_scan_result(json!({"done": true, "result": found})).unwrap(), Some(found));
+    }
+
+    #[test]
+    fn receipt_scan_returns_before_network_completion_and_cleanup_aborts_pending_work() {
+        let node = ["node", "node.exe", "/mnt/c/Program Files/nodejs/node.exe"]
+            .into_iter().find(|n| std::process::Command::new(n).arg("--version").output().is_ok());
+        let Some(node) = node else { eprintln!("node unavailable; JS fixture skipped"); return; };
+        for cancel in [false, true] {
+            let key = "__fixture_scan";
+            let scan = super::Channel::request_marker_scan_script("fixture-marker", 1, "[\"fixture-user\",\"fixture-account\"]").unwrap();
+            let start = super::Channel::request_marker_scan_start_script(key, &scan).unwrap();
+            let poll = super::Channel::request_marker_scan_poll_script(key).unwrap();
+            let cleanup = super::Channel::request_marker_scan_cleanup_script(key).unwrap();
+            let fixture = format!(r#"
+                const assert = require('node:assert/strict');
+                (async () => {{
+                    let release, aborted = false;
+                    global.fetch = async (url, options) => {{
+                        if (url === '/api/auth/session') {{
+                            await new Promise((resolve, reject) => {{
+                                release = resolve;
+                                options.signal.addEventListener('abort', () => {{ aborted = true; reject(new Error('aborted')); }});
+                            }});
+                            const claims = {{'https://api.openai.com/auth': {{chatgpt_account_id:'fixture-account'}}}};
+                            return {{ok:true,json:async()=>({{user:{{id:'fixture-user'}},accessToken:'fixture.'+Buffer.from(JSON.stringify(claims)).toString('base64url')+'.signature'}})}};
+                        }}
+                        return {{ok:true,json:async()=>({{items:[],total:0}})}};
+                    }};
+                    assert.equal(JSON.parse({start}).started, true);
+                    await Promise.resolve();
+                    assert.equal(JSON.parse({poll}).done, false);
+                    if ({cancel}) {{
+                        {cleanup};
+                        assert.equal(aborted, true);
+                        await new Promise(setImmediate);
+                        assert.equal(JSON.parse({poll}).missing, true);
+                    }} else {{
+                        release();
+                        await new Promise(setImmediate);
+                        const final = JSON.parse({poll});
+                        assert.equal(final.done, true);
+                        assert.deepEqual(final.result, {{ok:true,found:false,complete:true,checked:0}});
+                        {cleanup};
+                        assert.equal(JSON.parse({poll}).missing, true);
+                    }}
+                }})().catch(e=>{{console.error(e);process.exitCode=1;}});
+            "#);
+            let output = std::process::Command::new(node).args(["-e", &fixture]).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        }
+    }
+
+    #[test]
     fn conversation_scan_checks_user_markers_and_refuses_unreadable_records() {
         let node = ["node", "node.exe", "/mnt/c/Program Files/nodejs/node.exe"]
             .into_iter()
@@ -4016,10 +4158,12 @@ mod tests {
             "assistant-only",
             "wrong-account",
             "missing-account",
+            "old-page",
+            "unordered",
         ] {
             let js = super::Channel::request_marker_scan_script(
                 "[request: CREATED]",
-                1,
+                if mode == "old-page" || mode == "unordered" { 2_000_000_000 } else { 1 },
                 "[\"fixture-user\",\"fixture-account\"]",
             )
             .unwrap();
@@ -4035,7 +4179,9 @@ mod tests {
                     }}
                     backendCalls++;
                     const data = url.includes('conversations?')
-                      ? {{items: [{{id: 'fixture', update_time: '2026-10-14T00:00:00Z'}}], total: mode === 'partial' ? 2 : 1}}
+                      ? (mode === 'old-page' || mode === 'unordered'
+                        ? {{items: Array.from({{length:100}}, (_,i)=>({{id:'old-'+i, update_time: new Date(Date.UTC(2026,9,14) - i*1000 + (mode === 'unordered' && i === 1 ? 100000 : 0)).toISOString()}})), total:2000}}
+                        : {{items: [{{id: 'fixture', update_time: '2026-10-14T00:00:00Z'}}], total: mode === 'partial' ? 2 : 1}})
                       : mode === 'malformed' ? {{}} : {{mapping: {{a: {{message: {{author: {{role: mode === 'assistant-only' ? 'assistant' : 'user'}}, content: {{parts: [mode === 'absent' || mode === 'partial' ? 'other request' : '[request: CREATED]']}}}}}}}}}};
                     return {{ok: mode !== 'error', status: 500, json: async () => data}};
                 }};
@@ -4054,12 +4200,16 @@ mod tests {
             let scan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
             match mode {
                 "found" => assert_eq!(scan["found"], true),
-                "absent" | "assistant-only" => assert!(crate::receipt::scan_proves_absent(&scan)),
+                "absent" | "assistant-only" | "old-page" => assert!(crate::receipt::scan_proves_absent(&scan)),
                 // An incomplete listing or unreadable record never proves absence.
                 _ => assert!(!crate::receipt::scan_proves_absent(&scan)),
             }
             if mode == "wrong-account" || mode == "missing-account" {
                 assert_eq!(scan["backend_calls"], 0);
+            }
+            if mode == "old-page" {
+                assert_eq!(scan["backend_calls"], 1);
+                assert_eq!(scan["checked"], 0);
             }
         }
     }
