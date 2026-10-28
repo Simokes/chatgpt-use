@@ -37,6 +37,25 @@ persisted; *pinned* = the implementation has recorded that id for the session.
 | 3.3 | Enter landed; generation started (send button became stop) | Fallback fires anyway | Fallback must be inert | A duplicate prompt | pass (selector matches nothing once generating) |
 | 3.4 | Submit already happened; tab dies before any receipt | Recovery | Reattach to `/c/A`; never re-send | `reopen_fresh` + resend | pass (`reopen_fresh` is pre-pin & pre-submit only) |
 
+### Account-bound recovery scan
+
+`resume --resolve-unsent` starts the account-bound marker scan asynchronously
+and polls its result with short evaluations, so a history request cannot exceed
+the Chrome relay's eight-second evaluation limit. The channel's overall timeout
+still applies; cleanup aborts pending fetches and removes only that scan's job.
+A missing or malformed polling result never proves the request absent.
+
+The listing uses descending update order and validates that order across pages.
+Once a complete page crosses the request creation cutoff (including the existing
+60-second margin), older conversations cannot contain this request. Recovery can
+then finish without reading an account's entire history. Incomplete pages,
+unordered timestamps, unreadable records, account mismatch, and exhaustion of
+the scan budget retain the unknown submission state.
+
+Offline fixtures cover delayed fetches, cancellation, missing polling state,
+accounts with more than 1,000 older conversations, and unordered listings. Run
+`cargo test --offline -- --test-threads=1`; no live ChatGPT probe is required.
+
 ## 4. Completion observation
 
 | # | Precondition | Action | Required outcome | Forbidden outcome | chatgpt-use |
