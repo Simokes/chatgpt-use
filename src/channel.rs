@@ -687,12 +687,18 @@ const JS_ON_CHATGPT: &str =
 /// Read the mutually-exclusive Chat / Work creation-surface buttons. The
 /// control is intentionally located by its pressed-state contract, not by a
 /// page-global coordinate. Labels are used only to distinguish the two peers.
+///
+/// ChatGPT removed the Chat / Work toggle (late October 2026): with neither
+/// peer on the page, Chat is the only creation surface, so it is reported as
+/// Chat with `toggle:false`. Exactly one peer present is a half-rendered or
+/// changed control and still fails closed.
 const JS_CHAT_WORK_MODE: &str = r#"(() => {
   const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
   const nodes = [...document.querySelectorAll('button[aria-pressed], [role="button"][aria-pressed]')];
   const label = el => norm(el.getAttribute('aria-label') || el.textContent || '');
   const chat = nodes.find(el => label(el) === 'chat');
   const work = nodes.find(el => ['work', 'travail'].includes(label(el)));
+  if (!chat && !work) return JSON.stringify({ok:true, chat:true, work:false, toggle:false});
   if (!chat || !work) return JSON.stringify({ok:false, error:'Chat/Work controls not found'});
   const cp = chat.getAttribute('aria-pressed');
   const wp = work.getAttribute('aria-pressed');
@@ -1421,6 +1427,9 @@ impl Channel {
         }
         let chat = state.get("chat").and_then(|v| v.as_bool()).unwrap_or(false);
         let work = state.get("work").and_then(|v| v.as_bool()).unwrap_or(false);
+        if state.get("toggle").and_then(|v| v.as_bool()) == Some(false) {
+            eprintln!("surface: no Chat/Work toggle on the page; Chat is the only surface");
+        }
         if chat == work {
             bail!("Chat/Work state is ambiguous (chat={chat}, work={work})");
         }
@@ -4486,6 +4495,8 @@ mod tests {
             "work"
         } else if name.contains("chat-only-ambiguous") {
             "ambiguous"
+        } else if name.contains("chat-only-no-toggle") {
+            "no-toggle"
         } else if name.contains("stale-convo") {
             "stale-convo"
         } else {
@@ -4516,6 +4527,8 @@ if [ "$cmd" = "eval" ]; then
       printf '%s\n' '"{\"ok\":true,\"chat\":false,\"work\":true}"'
     elif [ "$FAKE_MODE" = "ambiguous" ]; then
       printf '%s\n' '"{\"ok\":false,\"error\":\"Chat/Work controls not found\"}"'
+    elif [ "$FAKE_MODE" = "no-toggle" ]; then
+      printf '%s\n' '"{\"ok\":true,\"chat\":true,\"work\":false,\"toggle\":false}"'
     else
       printf '%s\n' '"{\"ok\":true,\"chat\":true,\"work\":false}"'
     fi
@@ -4620,6 +4633,29 @@ fi
             "a fake surface that stays Work must fail closed"
         );
         assert!(format!("{:#}", result.unwrap_err()).contains("Chat could not be verified"));
+    }
+
+    #[test]
+    fn chat_work_probe_treats_a_removed_toggle_as_chat_but_not_a_half_one() {
+        let both_absent = JS_CHAT_WORK_MODE
+            .find("if (!chat && !work) return JSON.stringify({ok:true, chat:true, work:false, toggle:false});")
+            .expect("both peers absent is Chat");
+        let one_absent = JS_CHAT_WORK_MODE
+            .find("if (!chat || !work) return JSON.stringify({ok:false, error:'Chat/Work controls not found'});")
+            .expect("one peer absent still fails closed");
+        assert!(both_absent < one_absent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chat_only_accepts_surface_without_chat_work_toggle() {
+        let (ab, log) = fake_chrome_use("chat-only-no-toggle");
+        let channel = fake_channel(ab, None);
+        channel
+            .ensure_chat_only_fresh(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        let calls = std::fs::read_to_string(log).unwrap();
+        assert!(!calls.contains("Chat control not found"), "{calls}");
     }
 
     #[cfg(unix)]
