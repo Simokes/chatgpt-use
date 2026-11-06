@@ -32,8 +32,49 @@ const AB_BIN_CANDIDATES: &[&str] = &[
 ];
 
 const WEB_NEW_CHAT_URL: &str = "https://chatgpt.com/";
-const COMPOSER_SELECTOR: &str =
-    r#"#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]"#;
+// The raw selector belongs only to this resolver. CLI actions use its marker.
+const COMPOSER_SELECTOR: &str = "[data-agent-review-active-composer]";
+const JS_PREPARE_COMPOSER: &str =
+    r#"(() => { activeComposer().focus(); return JSON.stringify({ok:true}); })()"#;
+const JS_ACTIVE_COMPOSER: &str = r#"
+function activeComposer() {
+  const found = [...document.querySelectorAll('#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]')];
+  const visible = found.filter(el => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  });
+  for (const candidate of document.querySelectorAll('[data-agent-review-active-composer]'))
+    candidate.removeAttribute('data-agent-review-active-composer');
+  if (visible.length !== 1)
+    throw new Error('active composer refused: found=' + found.length + ', visible=' + visible.length);
+  visible[0].setAttribute('data-agent-review-active-composer', '');
+  return visible[0];
+}
+function composerPicker() {
+  const form = activeComposer().closest('form');
+  if (!form) return null;
+  const visible = b => {
+    const r = b.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const marked = [...form.querySelectorAll('button[data-codex-intelligence-trigger="true"]')].filter(visible);
+  if (marked.length) return marked.length === 1 ? marked[0] : null;
+  const hits = [...form.querySelectorAll('button[aria-haspopup="menu"]')]
+    .filter(b => !b.hasAttribute('data-trailing-button') && visible(b));
+  return hits.length === 1 ? hits[0] : null;
+}
+"#;
+
+fn composer_script(js: &str) -> String {
+    if !js.contains("activeComposer()") && !js.contains("composerPicker()") {
+        return js.to_string();
+    }
+    format!("(() => {{
+{JS_ACTIVE_COMPOSER}
+return ({js});
+}})()")
+}
+
 /// One shared chrome-use session name — deliberately NOT per-process.
 ///
 /// A different session name is a different tab, so the old `chatgpt-use-<pid>`
@@ -278,7 +319,7 @@ const JS_COMPOSER: &str = r#"(() => {
   const dlg = [...document.querySelectorAll('[role="dialog"]')]
     .map(d => d.textContent || '').join(' ');
   return JSON.stringify({
-    composer: !!document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]'),
+    composer: !!activeComposer(),
     limited: /too many requests|requests too quickly/i.test(dlg),
   });
 })()"#;
@@ -396,9 +437,7 @@ const JS_USER_COUNT: &str = r#"(() => {
 })()"#;
 
 const JS_SUBMIT_COMPOSER: &str = r#"(() => {
-  const composer = document.querySelector(
-    '#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]'
-  );
+  const composer = activeComposer();
   const form = composer && composer.closest('form');
   if (!form) return JSON.stringify({ok: false, error: 'composer form not found'});
   const button = form.querySelector('button[type="submit"]:not([disabled])');
@@ -437,7 +476,7 @@ const JS_DISMISS_DIALOG: &str = r#"(() => {
 // complete, correctly sized, and scrambled. FNV-1a over UTF-16 code units, which
 // both sides can compute identically.
 const JS_COMPOSER_FINGERPRINT: &str = r#"(() => {
-  const c = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]');
+  const c = activeComposer();
   const t = c ? (c.value ?? c.innerText ?? c.textContent ?? '') : '';
   const isWs = (u) =>
     (u >= 0x09 && u <= 0x0d) || u === 0x20 || u === 0x85 || u === 0xa0 ||
@@ -831,17 +870,7 @@ fn js_open_project_in_place(gizmo_id: &str) -> String {
 // coordinates. The composer moves between project root, blank chat, and an
 // existing conversation; the trailing slot is stable across those layouts.
 const JS_FIND_PICKER: &str = r#"(() => {
-  const composer = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]');
-  const form = composer && composer.closest('form');
-  let hit = document.querySelector('button[data-codex-intelligence-trigger="true"]');
-  if (!hit && form) {
-    const hits = [...form.querySelectorAll('button[aria-haspopup="menu"]')].filter(b => {
-      if (b.hasAttribute('data-trailing-button')) return false;
-      const r = b.getBoundingClientRect();
-      return r.width > 0 && r.height > 0;
-    });
-    if (hits.length === 1) hit = hits[0];
-  }
+  const hit = composerPicker();
   if (!hit) {
     return JSON.stringify({ok: false, error: 'composer intelligence trigger not found'});
   }
@@ -857,18 +886,7 @@ const JS_FIND_PICKER: &str = r#"(() => {
 })()"#;
 
 const JS_OPEN_PICKER: &str = r#"(() => {
-  const b = document.querySelector('button[data-codex-intelligence-trigger="true"]')
-    || (() => {
-      const composer = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"][role="textbox"]');
-      const form = composer && composer.closest('form');
-      if (!form) return null;
-      const hits = [...form.querySelectorAll('button[aria-haspopup="menu"]')].filter(x => {
-        if (x.hasAttribute('data-trailing-button')) return false;
-        const r = x.getBoundingClientRect();
-        return r.width > 0 && r.height > 0;
-      });
-      return hits.length === 1 ? hits[0] : null;
-    })();
+  const b = composerPicker();
   if (!b) return JSON.stringify({ok: false, error: 'composer intelligence trigger not found'});
   if (b.getAttribute('aria-expanded') === 'true') {
     return JSON.stringify({ok: true, already_open: true});
@@ -1836,12 +1854,9 @@ impl Channel {
                 .and_then(|v| v.get("ok").and_then(|x| x.as_bool()))
                 == Some(true);
             if !submitted {
-                let _ = ab_cmd(
-                    &self.ab,
-                    &["click", r#"button[data-testid="send-button"]"#],
-                    &self.session,
-                    budget,
-                );
+                return Err(SubmitFailure::Ambiguous(anyhow!(
+                    "active composer form submission failed; refusing a page-global send"
+                )));
             }
             if !self.await_user_turn(baseline_users, Duration::from_secs(5), budget) {
                 if let Some(path) = &self.receipt {
@@ -3098,7 +3113,7 @@ impl Channel {
             r#"(() => {{
   const gid = {gid};
   return JSON.stringify({{
-    composer: !!document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable=\"true\"][role=\"textbox\"]'),
+    composer: !!activeComposer(),
     in_project: (location.href || '').includes(gid),
   }});
 }})()"#,
@@ -3804,9 +3819,9 @@ fn which_bin(name: &str) -> Option<PathBuf> {
 }
 
 /// Paste text through chrome-use's native editor adapter. The combined
-/// selector is resolved once, at the moment of the action, so a hydration swap
-/// between ChatGPT's textarea and ProseMirror variants does not create a
-/// wait-then-fill race.
+/// selector is marked by the common resolver immediately before the action.
+/// A detached marker fails rather than selecting a hidden sibling.
+/// The fingerprint is checked again before submitting.
 fn ab_paste(ab: &PathBuf, text: &str, session: &str, timeout_secs: f64) -> Result<String> {
     ab_cmd(
         ab,
@@ -3945,6 +3960,12 @@ fn ab_cmd_with_profile(
 
 /// Run a chrome-use subcommand (no profile override).
 fn ab_cmd(ab: &PathBuf, args: &[&str], session: &str, timeout_secs: f64) -> Result<String> {
+    if args.contains(&COMPOSER_SELECTOR) || args == ["press", "Enter"] {
+        let state = ab_eval(ab, JS_PREPARE_COMPOSER, session, timeout_secs)?;
+        if state.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            bail!("could not validate active composer: {state}");
+        }
+    }
     ab_cmd_with_profile(ab, args, session, None, timeout_secs)
 }
 
@@ -3954,7 +3975,8 @@ fn ab_cmd(ab: &PathBuf, args: &[&str], session: &str, timeout_secs: f64) -> Resu
 /// chrome-use prints THAT string JSON-encoded, so we decode twice — once to get
 /// the inner JSON text, once to parse it into a value.
 fn ab_eval(ab: &PathBuf, js: &str, session: &str, timeout_secs: f64) -> Result<serde_json::Value> {
-    let raw = ab_cmd(ab, &["eval", js], session, timeout_secs)?;
+    let js = composer_script(js);
+    let raw = ab_cmd(ab, &["eval", &js], session, timeout_secs)?;
 
     // Scan from the last non-empty line for the first that decodes to a string.
     for line in raw.lines().rev() {
@@ -4060,6 +4082,7 @@ fn wait_composer(ab: &PathBuf, session: &str, deadline: Instant, tries: u32) -> 
                     return Ok(true);
                 }
             }
+            Err(e) if format!("{e:#}").contains("active composer refused:") => return Err(e),
             _ => {}
         }
 
@@ -4083,6 +4106,34 @@ fn detect_logged_in_profiles() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn active_composer_dom_contract() {
+        let node = ["node", "node.exe", "/mnt/c/Program Files/nodejs/node.exe"]
+            .into_iter().find(|n| std::process::Command::new(n).arg("--version").output().is_ok())
+            .expect("Node is required for the active composer DOM regression test");
+        let scripts = serde_json::json!({
+            "find": super::composer_script(super::JS_FIND_PICKER),
+            "open": super::composer_script(super::JS_OPEN_PICKER),
+            "presence": super::composer_script(super::JS_COMPOSER),
+            "fingerprint": super::composer_script(super::JS_COMPOSER_FINGERPRINT),
+            "submit": super::composer_script(super::JS_SUBMIT_COMPOSER),
+            "prepare": super::composer_script(super::JS_PREPARE_COMPOSER),
+        });
+        let fixture = format!("const scripts = {scripts}; const selector = {};\n{}",
+            serde_json::to_string(super::COMPOSER_SELECTOR).unwrap(),
+            include_str!("active_composer_fixture.js"));
+        let output = std::process::Command::new(node).args(["-e", &fixture]).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[test]
+    fn active_composer_has_no_raw_selector_bypasses() {
+        let source = include_str!("channel.rs").split("mod tests {").next().unwrap();
+        assert_eq!(source.matches("#prompt-textarea,").count(), 1);
+        assert_eq!(source.matches("div.ProseMirror[").count(), 1);
+        assert_eq!(super::COMPOSER_SELECTOR, "[data-agent-review-active-composer]");
+        assert!(!source.contains("click\", r#\"button[data-testid=\"send-button\"]"));
+    }
     #[test]
     fn receipt_scan_poll_never_treats_a_missing_or_pending_job_as_absent() {
         use serde_json::json;
@@ -4373,7 +4424,7 @@ mod tests {
         let captured = dir.join("prompt.txt");
         let args_path = dir.join("args.txt");
         let script = format!(
-            "#!/bin/sh\nset -eu\nprintf '%s' \"${{2-}}\" > '{captured}'\nprintf '%s\n' \"$1 $3 $4 $5 $6\" > '{args}'\nprintf '%s\n' ok\n",
+            "#!/bin/sh\nset -eu\nif [ \"$1\" = eval ]; then echo '{{\"ok\":true}}'; exit 0; fi\nprintf '%s' \"${{2-}}\" > '{captured}'\nprintf '%s\n' \"$1 $3 $4 $5 $6\" > '{args}'\nprintf '%s\n' ok\n",
             captured = captured.display(),
             args = args_path.display(),
         );
@@ -4464,8 +4515,8 @@ mod tests {
         // Current ChatGPT exposes a stable intelligence trigger on the active
         // composer form. Keep the probe structural and independent of localized
         // labels or generated element ids.
-        assert!(JS_FIND_PICKER.contains("data-codex-intelligence-trigger"));
-        assert!(JS_FIND_PICKER.contains("closest('form')"));
+        assert!(JS_ACTIVE_COMPOSER.contains("data-codex-intelligence-trigger"));
+        assert!(JS_ACTIVE_COMPOSER.contains("closest('form')"));
         assert!(!JS_FIND_PICKER.to_lowercase().contains("instant"));
         assert!(JS_OPEN_PICKER.contains("PointerEvent('pointerdown'"));
         assert!(
@@ -4876,18 +4927,11 @@ fi
         assert!(JS_STATE.contains(r#"[data-content-search-unit-key$=":user"]"#));
         assert!(JS_STATE.contains(r#"[data-content-search-unit-key$=":assistant"]"#));
         assert!(JS_LAST_ASSISTANT.contains(r#"[data-markdown-text-style="assistant-message"]"#));
-        for js in [JS_COMPOSER, JS_COMPOSER_FINGERPRINT] {
-            assert!(js.contains("#prompt-textarea"), "{js}");
-            assert!(
-                js.contains(r#"div.ProseMirror[contenteditable="true"][role="textbox"]"#),
-                "{js}"
-            );
+        for js in [JS_COMPOSER, JS_COMPOSER_FINGERPRINT, JS_SUBMIT_COMPOSER] {
+            assert!(js.contains("activeComposer()"));
         }
-        assert!(COMPOSER_SELECTOR.contains("#prompt-textarea"));
-        assert!(COMPOSER_SELECTOR
-            .contains(r#"div.ProseMirror[contenteditable="true"][role="textbox"]"#));
-        assert!(JS_FIND_PICKER.contains("data-codex-intelligence-trigger"));
-        assert!(JS_FIND_PICKER.contains("closest('form')"));
+        assert!(JS_ACTIVE_COMPOSER.contains("data-codex-intelligence-trigger"));
+        assert!(JS_FIND_PICKER.contains("composerPicker()"));
         assert!(JS_OPEN_PICKER.contains("PointerEvent('pointerdown'"));
         assert!(JS_SUBMIT_COMPOSER.contains("requestSubmit"));
     }
